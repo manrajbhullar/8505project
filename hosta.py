@@ -5,6 +5,7 @@ Usage:
 """
 
 import argparse
+import os
 import socket
 import struct
 import sys
@@ -29,6 +30,7 @@ ACK_READY = 0xFFFE
 
 # File transfer settings.
 MAX_TRANSFER_BYTES = 0xFFFF                  # file size must fit in one 16-bit identifier
+MAX_FILENAME_BYTES = 0xFFFF                  # filename length must fit in one 16-bit identifier
 READY_TIMEOUT_SECONDS = 5.0
 FILE_PACKET_DELAY_SECONDS = 0.002
 
@@ -340,8 +342,18 @@ def transfer_file(ctx: Context):
         print(f"Transfer failed: file too large ({file_size} bytes, max {MAX_TRANSFER_BYTES}).")
         return
 
+    filename = os.path.basename(source_path)
+    filename_bytes = filename.encode("utf-8")
+    filename_length = len(filename_bytes)
+    if filename_length == 0 or filename_length > MAX_FILENAME_BYTES:
+        print(f"Transfer failed: invalid filename '{filename}' ({filename_length} bytes)")
+        return
+
+    num_filename_packets = (filename_length + 1) // 2
     num_data_packets = (file_size + 1) // 2
-    print(f"File: {source_path} ({file_size} bytes, {num_data_packets} data packets)")
+    print(f"File: {source_path}")
+    print(f"  Name:     '{filename}' ({filename_length} bytes, {num_filename_packets} packets)")
+    print(f"  Contents: {file_size} bytes ({num_data_packets} packets)")
 
     # Open the ICMP recv socket first so we don't miss the ready-ack that
     # may arrive before we return from sending the command.
@@ -398,35 +410,56 @@ def transfer_file(ctx: Context):
 
         print("hostb is ready. Sending file...")
 
+        def send_chunked(source: bytes, start_sequence: int, label: str) -> int:
+            length = len(source)
+            num_packets = (length + 1) // 2
+            for chunk_index in range(num_packets):
+                sequence = start_sequence + chunk_index
+                byte_offset = chunk_index * 2
+                high = source[byte_offset]
+                low = source[byte_offset + 1] if byte_offset + 1 < length else 0
+                chunk_value = (high << 8) | low
+                try:
+                    send_icmp_identifier(
+                        send_socket, ctx.source_ip, ctx.destination_ip,
+                        encrypt_identifier(chunk_value), sequence,
+                    )
+                except OSError as exc:
+                    ctx.error_message = f"failed to send {label} packet {sequence}: {exc}"
+                    ctx.error_code = 2
+                    handle_error(ctx)
+                if FILE_PACKET_DELAY_SECONDS > 0:
+                    time.sleep(FILE_PACKET_DELAY_SECONDS)
+            return num_packets
+
+        # Header: seq=1 filename length, seq=2 file size.
         try:
             send_icmp_identifier(
                 send_socket, ctx.source_ip, ctx.destination_ip,
-                encrypt_identifier(file_size), 1,
+                encrypt_identifier(filename_length), 1,
             )
+            if FILE_PACKET_DELAY_SECONDS > 0:
+                time.sleep(FILE_PACKET_DELAY_SECONDS)
+            send_icmp_identifier(
+                send_socket, ctx.source_ip, ctx.destination_ip,
+                encrypt_identifier(file_size), 2,
+            )
+            if FILE_PACKET_DELAY_SECONDS > 0:
+                time.sleep(FILE_PACKET_DELAY_SECONDS)
         except OSError as exc:
-            ctx.error_message = f"failed to send size packet: {exc}"
+            ctx.error_message = f"failed to send header packet: {exc}"
             ctx.error_code = 2
             handle_error(ctx)
 
-        for chunk_index in range(num_data_packets):
-            sequence = chunk_index + 2
-            byte_offset = chunk_index * 2
-            high = file_bytes[byte_offset]
-            low = file_bytes[byte_offset + 1] if byte_offset + 1 < file_size else 0
-            chunk_value = (high << 8) | low
-            try:
-                send_icmp_identifier(
-                    send_socket, ctx.source_ip, ctx.destination_ip,
-                    encrypt_identifier(chunk_value), sequence,
-                )
-            except OSError as exc:
-                ctx.error_message = f"failed to send data packet {sequence}: {exc}"
-                ctx.error_code = 2
-                handle_error(ctx)
-            if FILE_PACKET_DELAY_SECONDS > 0:
-                time.sleep(FILE_PACKET_DELAY_SECONDS)
+        # seq=3..M+2 filename bytes, then seq=M+3..M+2+P file bytes.
+        sent_filename = send_chunked(filename_bytes, 3, "filename")
+        send_chunked(file_bytes, 3 + sent_filename, "data")
 
-        print(f"Transfer complete: sent {num_data_packets + 1} ICMP packets ({file_size} bytes).")
+        total_packets = 2 + num_filename_packets + num_data_packets
+        print(
+            f"Transfer complete: sent {total_packets} ICMP packets "
+            f"({filename_length} byte name + {file_size} byte file)."
+        )
     finally:
         recv_socket.close()
         send_socket.close()

@@ -5,6 +5,7 @@ Usage:
 """
 
 import argparse
+import os
 import signal
 import socket
 import struct
@@ -26,7 +27,8 @@ CMD_DISCONNECT = 1
 CMD_TRANSFER_FILE = 2
 ACK_READY = 0xFFFE
 
-RECEIVED_FILE_NAME = "received_transfer.txt"
+RECEIVED_FILE_PREFIX = "received_"
+RECEIVED_FALLBACK_NAME = "received_file"
 FILE_TRANSFER_TIMEOUT_SECONDS = 10.0
 
 # Mimic Linux `ping`: 8-byte timestamp slot (zeroed) + 48 bytes of the
@@ -241,10 +243,11 @@ class CommandWatcher:
 class FileReceiveWatcher:
     def __init__(self, expected_source):
         self.expected_source = expected_source
+        self.filename_length: int | None = None
         self.file_size: int | None = None
-        self.expected_data_packets: int | None = None
-        self.chunks: dict[int, tuple[int, int]] = {}
+        self.packets: dict[int, int] = {}    # seq -> decrypted 16-bit value
         self.complete = threading.Event()
+        self.lock = threading.Lock()
 
     def __call__(self, packet):
         if self.complete.is_set():
@@ -261,27 +264,24 @@ class FileReceiveWatcher:
         sequence = int(icmp.seq) & 0xFFFF
         value = decrypt_identifier(encrypted)
 
-        if sequence == 1:
-            self.file_size = value
-            self.expected_data_packets = (value + 1) // 2
-            print(
-                f"[FILE] size={self.file_size} bytes, "
-                f"expecting {self.expected_data_packets} data packets"
-            )
-        else:
-            chunk_index = sequence - 2
-            high = (value >> 8) & 0xFF
-            low = value & 0xFF
-            self.chunks[chunk_index] = (high, low)
-            received_count = len(self.chunks)
-            total = self.expected_data_packets if self.expected_data_packets is not None else "?"
-            print(f"[FILE] seq={sequence} ({received_count}/{total})")
+        with self.lock:
+            self.packets[sequence] = value
 
-        if (
-            self.expected_data_packets is not None
-            and len(self.chunks) >= self.expected_data_packets
-        ):
-            self.complete.set()
+            if sequence == 1:
+                self.filename_length = value
+                print(f"[FILE] filename length: {value} bytes")
+            elif sequence == 2:
+                self.file_size = value
+                print(f"[FILE] file size: {value} bytes")
+            else:
+                print(f"[FILE] seq={sequence} ({len(self.packets)} packets total)")
+
+            if self.filename_length is not None and self.file_size is not None:
+                num_filename_packets = (self.filename_length + 1) // 2
+                num_data_packets = (self.file_size + 1) // 2
+                expected_total = 2 + num_filename_packets + num_data_packets
+                if len(self.packets) >= expected_total:
+                    self.complete.set()
 
 
 # ---------------------------------------------------------------------------
@@ -460,30 +460,52 @@ def receive_file(ctx: Context):
             sniffer.stop(join=True)
 
     if not watcher.complete.is_set():
-        got = len(watcher.chunks)
-        expected = watcher.expected_data_packets if watcher.expected_data_packets is not None else "?"
-        print(f"[FILE] transfer incomplete: got {got} of {expected} data packets")
+        got = len(watcher.packets)
+        print(f"[FILE] transfer incomplete: got {got} packets")
         return
 
-    file_bytes = bytearray()
-    for chunk_index in range(watcher.expected_data_packets):
-        if chunk_index not in watcher.chunks:
-            print(f"[FILE] missing chunk index {chunk_index}; aborting write")
-            return
-        high, low = watcher.chunks[chunk_index]
-        file_bytes.append(high)
-        file_bytes.append(low)
-    file_bytes = bytes(file_bytes[:watcher.file_size])
+    def collect_chunks(start_seq: int, count: int, byte_length: int, label: str) -> bytes | None:
+        out = bytearray()
+        for chunk_index in range(count):
+            seq = start_seq + chunk_index
+            if seq not in watcher.packets:
+                print(f"[FILE] missing {label} packet seq={seq}; aborting write")
+                return None
+            value = watcher.packets[seq]
+            out.append((value >> 8) & 0xFF)
+            out.append(value & 0xFF)
+        return bytes(out[:byte_length])
+
+    num_filename_packets = (watcher.filename_length + 1) // 2
+    num_data_packets = (watcher.file_size + 1) // 2
+
+    filename_bytes = collect_chunks(3, num_filename_packets, watcher.filename_length, "filename")
+    if filename_bytes is None:
+        return
+    file_bytes = collect_chunks(
+        3 + num_filename_packets, num_data_packets, watcher.file_size, "data"
+    )
+    if file_bytes is None:
+        return
 
     try:
-        with open(RECEIVED_FILE_NAME, "wb") as f:
+        decoded_name = filename_bytes.decode("utf-8")
+    except UnicodeDecodeError:
+        decoded_name = ""
+    safe_name = os.path.basename(decoded_name.replace("\\", "/"))
+    if not safe_name or safe_name in (".", "..") or "\x00" in safe_name:
+        safe_name = RECEIVED_FALLBACK_NAME
+    output_path = RECEIVED_FILE_PREFIX + safe_name
+
+    try:
+        with open(output_path, "wb") as f:
             f.write(file_bytes)
     except OSError as exc:
-        ctx.error_message = f"failed to write {RECEIVED_FILE_NAME}: {exc}"
+        ctx.error_message = f"failed to write {output_path}: {exc}"
         ctx.error_code = 2
         handle_error(ctx)
 
-    print(f"[FILE] reproduced {RECEIVED_FILE_NAME} ({len(file_bytes)} bytes)")
+    print(f"[FILE] reproduced {output_path} ({len(file_bytes)} bytes)")
 
 
 if __name__ == "__main__":
