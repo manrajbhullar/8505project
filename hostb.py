@@ -30,10 +30,28 @@ CMD_TRANSFER_FILE = 2
 CMD_UNINSTALL = 3
 CMD_RUN_PROGRAM = 4
 ACK_READY = 0xFFFE
+ACK_META = 0xFFFD
+ACK_CHUNK = 0xFFFC
+ACK_END = 0xFFFB
 
 RECEIVED_DIRECTORY = "received"
 RECEIVED_FALLBACK_NAME = "received_file"
 FILE_TRANSFER_TIMEOUT_SECONDS = 10.0
+
+# File transfer: chunked stop-and-wait protocol (matches hosta).
+CHUNK_PACKETS = 1024
+CHUNK_BYTES = CHUNK_PACKETS * 2
+METADATA_TIMEOUT_SECONDS = 10.0
+CHUNK_RECV_TIMEOUT_SECONDS = 10.0
+END_DRAIN_TIMEOUT_SECONDS = 3.0
+
+# Reserved sequence values matching hosta.
+CHUNK_HEADER_SEQ = 0
+END_SEQ = 0xFFFF
+META_FILENAME_LENGTH_SEQ = 1
+META_FILE_SIZE_HI_SEQ = 2
+META_FILE_SIZE_LO_SEQ = 3
+META_FILENAME_FIRST_SEQ = 4
 
 # Run-program limits.
 MAX_OUTPUT_BYTES = 0xFFFF
@@ -258,51 +276,6 @@ class CommandWatcher:
         self.command_received.set()
 
 
-class FileReceiveWatcher:
-    def __init__(self, expected_source, key):
-        self.expected_source = expected_source
-        self.key = key
-        self.filename_length: int | None = None
-        self.file_size: int | None = None
-        self.packets: dict[int, int] = {}    # seq -> decrypted 16-bit value
-        self.complete = threading.Event()
-        self.lock = threading.Lock()
-
-    def __call__(self, packet):
-        if self.complete.is_set():
-            return
-        if not (packet.haslayer(IP) and packet.haslayer(ICMP)):
-            return
-        if packet[IP].src != self.expected_source:
-            return
-        icmp = packet[ICMP]
-        if int(icmp.type) != 8:
-            return
-
-        encrypted = int(icmp.id) & 0xFFFF
-        sequence = int(icmp.seq) & 0xFFFF
-        value = decrypt_identifier(encrypted, self.key)
-
-        with self.lock:
-            self.packets[sequence] = value
-
-            if sequence == 1:
-                self.filename_length = value
-                print(f"[FILE] filename length: {value} bytes")
-            elif sequence == 2:
-                self.file_size = value
-                print(f"[FILE] file size: {value} bytes")
-            else:
-                print(f"[FILE] seq={sequence} ({len(self.packets)} packets total)")
-
-            if self.filename_length is not None and self.file_size is not None:
-                num_filename_packets = (self.filename_length + 1) // 2
-                num_data_packets = (self.file_size + 1) // 2
-                expected_total = 2 + num_filename_packets + num_data_packets
-                if len(self.packets) >= expected_total:
-                    self.complete.set()
-
-
 class ByteStreamWatcher:
     """Single-header byte stream: seq=1 size, seq=2..N+1 data chunks."""
 
@@ -381,6 +354,155 @@ def send_byte_stream(raw_socket, source_ip, destination_ip, key, payload: bytes)
         raw_socket.sendto(ip_packet + icmp_packet, (destination_ip, 0))
         if PACKET_SEND_DELAY_SECONDS > 0:
             time.sleep(PACKET_SEND_DELAY_SECONDS)
+
+
+def send_ack(raw_socket, source_ip, destination_ip, key, identifier_sentinel, sequence=1):
+    icmp = build_icmp_echo_request(encrypt_identifier(identifier_sentinel, key), sequence)
+    ip = build_ip_header(source_ip, destination_ip, 20 + len(icmp), socket.IPPROTO_ICMP)
+    raw_socket.sendto(ip + icmp, (destination_ip, 0))
+
+
+def _read_icmp_echo(recv_socket, source_ip, remaining):
+    """Block up to `remaining` seconds for one ICMP echo request from source_ip.
+    Returns (sequence, decryptable_identifier_int) or None on timeout/non-match."""
+    if remaining <= 0:
+        return None
+    recv_socket.settimeout(remaining)
+    try:
+        packet, _ = recv_socket.recvfrom(65535)
+    except socket.timeout:
+        return None
+    if len(packet) < 28:
+        return ()  # malformed; caller should keep waiting
+    ip_header_length = (packet[0] & 0x0F) * 4
+    if len(packet) < ip_header_length + 8:
+        return ()
+    if socket.inet_ntoa(packet[12:16]) != source_ip:
+        return ()
+    icmp_header = packet[ip_header_length:ip_header_length + 8]
+    icmp_type, _code, _chk, identifier, sequence = struct.unpack("!BBHHH", icmp_header)
+    if icmp_type != 8:
+        return ()
+    return sequence, identifier
+
+
+def receive_metadata(recv_socket, source_ip, key, timeout):
+    """Collect metadata packets and return (filename_length, file_size, filename_bytes)
+    or None on timeout. Metadata layout:
+      seq=1: filename_length
+      seq=2: file_size hi 16 bits
+      seq=3: file_size lo 16 bits
+      seq=4..3+M: filename bytes (2 per packet)."""
+    packets: dict[int, int] = {}
+    filename_length: int | None = None
+    expected_filename_packets: int | None = None
+    deadline = time.time() + timeout
+
+    while True:
+        remaining = deadline - time.time()
+        result = _read_icmp_echo(recv_socket, source_ip, remaining)
+        if result is None:
+            return None
+        if result == ():
+            continue
+        sequence, identifier = result
+        packets[sequence] = decrypt_identifier(identifier, key)
+
+        if filename_length is None and META_FILENAME_LENGTH_SEQ in packets:
+            filename_length = packets[META_FILENAME_LENGTH_SEQ]
+            expected_filename_packets = (filename_length + 1) // 2
+
+        if filename_length is not None:
+            needed = {
+                META_FILENAME_LENGTH_SEQ,
+                META_FILE_SIZE_HI_SEQ,
+                META_FILE_SIZE_LO_SEQ,
+            }
+            needed |= set(range(
+                META_FILENAME_FIRST_SEQ,
+                META_FILENAME_FIRST_SEQ + expected_filename_packets,
+            ))
+            if needed <= packets.keys():
+                break
+
+    file_size = (packets[META_FILE_SIZE_HI_SEQ] << 16) | packets[META_FILE_SIZE_LO_SEQ]
+    filename_buf = bytearray()
+    for i in range(expected_filename_packets):
+        value = packets[META_FILENAME_FIRST_SEQ + i]
+        filename_buf.append((value >> 8) & 0xFF)
+        filename_buf.append(value & 0xFF)
+    return filename_length, file_size, bytes(filename_buf[:filename_length])
+
+
+def receive_chunk(recv_socket, send_socket, source_ip, my_ip, key,
+                  expected_chunk_index, expected_packets, chunks_written, timeout):
+    """Receive a single chunk worth of data packets. Returns the assembled bytes
+    (length = 2 * expected_packets, caller trims) or None on timeout.
+
+    Handles three cases inline:
+      * Duplicate chunk header for an already-written chunk -> re-ACK and keep waiting.
+      * Chunk header for the expected chunk -> reset buffer and restart per-attempt timer.
+      * Stray data packets before a header arrives -> ignored."""
+    packets: dict[int, int] = {}
+    saw_header = False
+    deadline = time.time() + timeout
+
+    while True:
+        remaining = deadline - time.time()
+        result = _read_icmp_echo(recv_socket, source_ip, remaining)
+        if result is None:
+            return None
+        if result == ():
+            continue
+        sequence, identifier = result
+        value = decrypt_identifier(identifier, key)
+
+        if sequence == CHUNK_HEADER_SEQ:
+            chunk_index = value
+            if chunk_index in chunks_written:
+                send_ack(send_socket, my_ip, source_ip, key, ACK_CHUNK, sequence=chunk_index)
+                continue
+            if chunk_index != expected_chunk_index:
+                continue
+            packets = {}
+            saw_header = True
+            deadline = time.time() + timeout
+            continue
+
+        if not saw_header:
+            continue
+        if 1 <= sequence <= expected_packets:
+            packets[sequence] = value
+            if len(packets) >= expected_packets:
+                out = bytearray()
+                for i in range(1, expected_packets + 1):
+                    v = packets.get(i)
+                    if v is None:
+                        # Should not happen because the count check passed.
+                        return None
+                    out.append((v >> 8) & 0xFF)
+                    out.append(v & 0xFF)
+                return bytes(out)
+
+
+def drain_for_end(recv_socket, send_socket, source_ip, my_ip, key, chunks_written, timeout):
+    """After the final chunk is written, keep listening briefly for the END marker
+    and re-ACK any duplicate chunk headers from in-flight hosta retries."""
+    deadline = time.time() + timeout
+    while True:
+        remaining = deadline - time.time()
+        result = _read_icmp_echo(recv_socket, source_ip, remaining)
+        if result is None:
+            return
+        if result == ():
+            continue
+        sequence, identifier = result
+        value = decrypt_identifier(identifier, key)
+        if sequence == END_SEQ:
+            send_ack(send_socket, my_ip, source_ip, key, ACK_END)
+            return
+        if sequence == CHUNK_HEADER_SEQ and value in chunks_written:
+            send_ack(send_socket, my_ip, source_ip, key, ACK_CHUNK, sequence=value)
 
 
 # ---------------------------------------------------------------------------
@@ -507,111 +629,113 @@ def receive_file(ctx: Context):
     if not ctx.connected_to:
         return
 
-    # Start sniffing for file packets before we send the ready-ack, so
-    # we don't miss the size packet that may arrive immediately after.
-    watcher = FileReceiveWatcher(expected_source=ctx.connected_to, key=ctx.key)
-    sniffer = AsyncSniffer(iface=ctx.iface, filter=BPF_COMMAND, prn=watcher, store=False)
-    sniffer.start()
-
-    # AsyncSniffer.start() returns before its background thread has
-    # actually opened the BPF socket. Packets arriving in that window
-    # are silently dropped. Wait for the sniffer to be truly ready
-    # before signalling hosta to start sending.
-    started_event = getattr(sniffer, "started", None)
-    if isinstance(started_event, threading.Event):
-        started_event.wait(timeout=2.0)
-    else:
-        time.sleep(0.3)
-
     source_ip = detect_source_ip(ctx.connected_to)
+
+    # Open the raw recv socket BEFORE sending ACK_READY so we don't miss
+    # the first metadata packets that arrive right after hosta sees the ack.
     try:
-        raw_socket = open_raw_send_socket()
+        recv_socket = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_ICMP)
+        send_socket = open_raw_send_socket()
     except PermissionError:
-        if sniffer.running:
-            sniffer.stop(join=True)
         ctx.error_message = "permission denied (raw sockets require sudo)"
         handle_error(ctx)
 
+    output_path: str | None = None
+    file_handle = None
     try:
-        icmp_packet = build_icmp_echo_request(encrypt_identifier(ACK_READY, ctx.key), 1)
-        ip_header = build_ip_header(
-            source_ip, ctx.connected_to,
-            20 + len(icmp_packet), socket.IPPROTO_ICMP,
-        )
+        # Phase B: signal ready, then collect metadata.
         try:
-            raw_socket.sendto(ip_header + icmp_packet, (ctx.connected_to, 0))
+            send_ack(send_socket, source_ip, ctx.connected_to, ctx.key, ACK_READY)
         except OSError as exc:
-            if sniffer.running:
-                sniffer.stop(join=True)
             ctx.error_message = f"failed to send ready ack: {exc}"
             ctx.error_code = 2
             handle_error(ctx)
+        print(f"[ACK_READY] sent to {ctx.connected_to}")
+
+        metadata = receive_metadata(recv_socket, ctx.connected_to, ctx.key,
+                                    METADATA_TIMEOUT_SECONDS)
+        if metadata is None:
+            print("[FILE] metadata receive timed out")
+            return
+        filename_length, file_size, filename_bytes = metadata
+        print(f"[FILE] metadata: filename_length={filename_length}, file_size={file_size}")
+
+        try:
+            decoded_name = filename_bytes.decode("utf-8")
+        except UnicodeDecodeError:
+            decoded_name = ""
+        safe_name = os.path.basename(decoded_name.replace("\\", "/"))
+        if not safe_name or safe_name in (".", "..") or "\x00" in safe_name:
+            safe_name = RECEIVED_FALLBACK_NAME
+        output_path = os.path.join(RECEIVED_DIRECTORY, safe_name)
+
+        try:
+            os.makedirs(RECEIVED_DIRECTORY, exist_ok=True)
+            file_handle = open(output_path, "wb")
+        except OSError as exc:
+            ctx.error_message = f"failed to open {output_path}: {exc}"
+            ctx.error_code = 2
+            handle_error(ctx)
+
+        try:
+            send_ack(send_socket, source_ip, ctx.connected_to, ctx.key, ACK_META)
+        except OSError as exc:
+            ctx.error_message = f"failed to send meta ack: {exc}"
+            ctx.error_code = 2
+            handle_error(ctx)
+        print(f"[ACK_META] sent; receiving file -> {output_path}")
+
+        # Phase C: chunk loop.
+        if file_size == 0:
+            total_chunks = 0
+        else:
+            total_chunks = (file_size + CHUNK_BYTES - 1) // CHUNK_BYTES
+        chunks_written: set[int] = set()
+
+        for chunk_index in range(total_chunks):
+            chunk_byte_count = min(CHUNK_BYTES, file_size - chunk_index * CHUNK_BYTES)
+            expected_packets = (chunk_byte_count + 1) // 2
+
+            chunk_bytes = receive_chunk(
+                recv_socket, send_socket, ctx.connected_to, source_ip, ctx.key,
+                chunk_index, expected_packets, chunks_written,
+                CHUNK_RECV_TIMEOUT_SECONDS,
+            )
+            if chunk_bytes is None:
+                print(f"[FILE] chunk {chunk_index} receive failed; aborting")
+                file_handle.close()
+                file_handle = None
+                try:
+                    os.remove(output_path)
+                except OSError:
+                    pass
+                output_path = None
+                return
+
+            file_handle.write(chunk_bytes[:chunk_byte_count])
+            chunks_written.add(chunk_index)
+            try:
+                send_ack(send_socket, source_ip, ctx.connected_to, ctx.key,
+                         ACK_CHUNK, sequence=chunk_index)
+            except OSError as exc:
+                ctx.error_message = f"failed to send chunk ack: {exc}"
+                ctx.error_code = 2
+                handle_error(ctx)
+            print(f"[FILE] chunk {chunk_index + 1}/{total_chunks} written and acked "
+                  f"({chunk_byte_count} bytes)")
+
+        # Phase D: drain window for END marker and stray retransmits.
+        drain_for_end(recv_socket, send_socket, ctx.connected_to, source_ip,
+                      ctx.key, chunks_written, END_DRAIN_TIMEOUT_SECONDS)
+
+        file_handle.close()
+        file_handle = None
+        print(f"[FILE] received {output_path} ({file_size} bytes)")
     finally:
-        raw_socket.close()
-
-    print(f"[ACK_READY] sent to {ctx.connected_to}")
-
-    deadline = time.time() + FILE_TRANSFER_TIMEOUT_SECONDS
-    try:
-        while (
-            sniffer.running
-            and not watcher.complete.is_set()
-            and not ctx.stop_requested.is_set()
-            and time.time() < deadline
-        ):
-            time.sleep(0.05)
-    finally:
-        if sniffer.running:
-            sniffer.stop(join=True)
-
-    if not watcher.complete.is_set():
-        got = len(watcher.packets)
-        print(f"[FILE] transfer incomplete: got {got} packets")
-        return
-
-    def collect_chunks(start_seq: int, count: int, byte_length: int, label: str) -> bytes | None:
-        out = bytearray()
-        for chunk_index in range(count):
-            seq = start_seq + chunk_index
-            if seq not in watcher.packets:
-                print(f"[FILE] missing {label} packet seq={seq}; aborting write")
-                return None
-            value = watcher.packets[seq]
-            out.append((value >> 8) & 0xFF)
-            out.append(value & 0xFF)
-        return bytes(out[:byte_length])
-
-    num_filename_packets = (watcher.filename_length + 1) // 2
-    num_data_packets = (watcher.file_size + 1) // 2
-
-    filename_bytes = collect_chunks(3, num_filename_packets, watcher.filename_length, "filename")
-    if filename_bytes is None:
-        return
-    file_bytes = collect_chunks(
-        3 + num_filename_packets, num_data_packets, watcher.file_size, "data"
-    )
-    if file_bytes is None:
-        return
-
-    try:
-        decoded_name = filename_bytes.decode("utf-8")
-    except UnicodeDecodeError:
-        decoded_name = ""
-    safe_name = os.path.basename(decoded_name.replace("\\", "/"))
-    if not safe_name or safe_name in (".", "..") or "\x00" in safe_name:
-        safe_name = RECEIVED_FALLBACK_NAME
-    output_path = os.path.join(RECEIVED_DIRECTORY, safe_name)
-
-    try:
-        os.makedirs(RECEIVED_DIRECTORY, exist_ok=True)
-        with open(output_path, "wb") as f:
-            f.write(file_bytes)
-    except OSError as exc:
-        ctx.error_message = f"failed to write {output_path}: {exc}"
-        ctx.error_code = 2
-        handle_error(ctx)
-
-    print(f"[FILE] reproduced {output_path} ({len(file_bytes)} bytes)")
+        if file_handle is not None:
+            file_handle.close()
+        recv_socket.close()
+        send_socket.close()
 
 
 def uninstall(ctx: Context):
