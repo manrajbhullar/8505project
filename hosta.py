@@ -51,7 +51,9 @@ RECV_BUFFER_BYTES = 8 * 1024 * 1024       # ask kernel for big recv buffer
 READY_TIMEOUT_SECONDS = 5.0
 META_ACK_TIMEOUT_SECONDS = 5.0
 CHUNK_ACK_TIMEOUT_SECONDS = 5.0
+CHUNK_RECV_TIMEOUT_SECONDS = 10.0            # per-attempt timeout receiving a chunk
 END_ACK_TIMEOUT_SECONDS = 3.0
+END_DRAIN_TIMEOUT_SECONDS = 3.0
 MAX_CHUNK_RETRIES = 5
 
 # Reserved sequence values for the transfer protocol.
