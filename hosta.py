@@ -1,19 +1,22 @@
-#!/usr/bin/env python3
 """hosta: control center for the remote administration tool.
 
-Presents a menu. Option 1 port-knocks hostb and waits for the
-raw-socket ack that confirms the connection. Option 2 sends the
-disconnect command via raw ICMP (encrypted in the identifier field,
-sequence number in the sequence field).
+FSM:
+    parse_arguments -> handle_arguments -> display_menu (loop)
+        option 1 -> establish_session
+        option 2 -> send_command(CMD_DISCONNECT)
+    on any failure -> handle_error -> exit
 
 Usage:
-    sudo python3 hosta.py <hostb_ip>
+    sudo python3 hosta.py -a <hostb_ip>
 """
 
+import argparse
 import socket
 import struct
 import sys
 import time
+from dataclasses import dataclass
+
 
 KNOCK_PORTS = (7000, 8000, 9000)
 KNOCK_DELAY_SECONDS = 0.1
@@ -22,9 +25,9 @@ TTL = 64
 ACK_TIMEOUT_SECONDS = 5.0
 TCP_ACK_FLAG = 0x10
 
-# Command-channel protocol: command code lives in the ICMP identifier
-# (16 bits, XOR-encrypted with PRE_SHARED_KEY); sequence number lives
-# in the ICMP sequence field in cleartext.
+# Command-channel protocol: command code goes in the ICMP identifier
+# (16 bits, XOR-encrypted with PRE_SHARED_KEY); sequence in the ICMP
+# sequence field in cleartext.
 PRE_SHARED_KEY = 0xA5C3
 CMD_DISCONNECT = 1
 
@@ -45,33 +48,46 @@ MENU_OPTIONS = (
 )
 
 
-def detect_source_ip(destination_ip: str) -> str:
-    probe_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+@dataclass
+class HostaArgs:
+    hostb_ip: str
+
+
+@dataclass
+class Context:
+    args: HostaArgs | None = None
+    error_message: str | None = None
+    error_code: int = 1
+    destination_ip: str = ""
+    source_ip: str = ""
+    connected: bool = False
+
+
+# ---------------------------------------------------------------------------
+# Protocol helpers
+# ---------------------------------------------------------------------------
+
+def detect_source_ip(destination_ip):
+    probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
-        probe_socket.connect((destination_ip, 1))
-        return probe_socket.getsockname()[0]
+        probe.connect((destination_ip, 1))
+        return probe.getsockname()[0]
     finally:
-        probe_socket.close()
+        probe.close()
 
 
-def compute_checksum(data: bytes) -> int:
+def compute_checksum(data):
     if len(data) % 2:
         data += b"\x00"
-    running_total = 0
-    for byte_pair_start in range(0, len(data), 2):
-        word = (data[byte_pair_start] << 8) + data[byte_pair_start + 1]
-        running_total += word
-        running_total = (running_total & 0xFFFF) + (running_total >> 16)
-    return ~running_total & 0xFFFF
+    total = 0
+    for i in range(0, len(data), 2):
+        total += (data[i] << 8) + data[i + 1]
+        total = (total & 0xFFFF) + (total >> 16)
+    return ~total & 0xFFFF
 
 
-def build_ip_header(
-    source_ip: str,
-    destination_ip: str,
-    total_length: int,
-    protocol: int = socket.IPPROTO_TCP,
-) -> bytes:
-    def header_with_checksum(checksum_value: int) -> bytes:
+def build_ip_header(source_ip, destination_ip, total_length, protocol=socket.IPPROTO_TCP):
+    def with_checksum(checksum):
         return struct.pack(
             "!BBHHHBBH4s4s",
             0x45,                     # version 4, header length 5 (20 bytes)
@@ -81,18 +97,15 @@ def build_ip_header(
             0,                        # flags + fragment offset
             TTL,
             protocol,
-            checksum_value,
+            checksum,
             socket.inet_aton(source_ip),
             socket.inet_aton(destination_ip),
         )
-    correct_checksum = compute_checksum(header_with_checksum(0))
-    return header_with_checksum(correct_checksum)
+    return with_checksum(compute_checksum(with_checksum(0)))
 
 
-def build_tcp_syn_header(
-    source_ip: str, destination_ip: str, destination_port: int
-) -> bytes:
-    def header_with_checksum(checksum_value: int) -> bytes:
+def build_tcp_syn_header(source_ip, destination_ip, destination_port):
+    def with_checksum(checksum):
         return struct.pack(
             "!HHLLBBHHH",
             SOURCE_PORT,
@@ -102,10 +115,10 @@ def build_tcp_syn_header(
             0x50,                     # data offset 5 (20 bytes), reserved 0
             0x02,                     # flags: SYN only
             65535,                    # window
-            checksum_value,
+            checksum,
             0,                        # urgent pointer
         )
-    pseudo_header = struct.pack(
+    pseudo = struct.pack(
         "!4s4sBBH",
         socket.inet_aton(source_ip),
         socket.inet_aton(destination_ip),
@@ -113,169 +126,200 @@ def build_tcp_syn_header(
         socket.IPPROTO_TCP,
         20,                           # TCP header length
     )
-    correct_checksum = compute_checksum(pseudo_header + header_with_checksum(0))
-    return header_with_checksum(correct_checksum)
+    return with_checksum(compute_checksum(pseudo + with_checksum(0)))
 
 
-def send_single_knock(
-    raw_socket: socket.socket,
-    source_ip: str,
-    destination_ip: str,
-    destination_port: int,
-) -> None:
-    tcp_header = build_tcp_syn_header(source_ip, destination_ip, destination_port)
-    ip_header = build_ip_header(source_ip, destination_ip, 20 + len(tcp_header))
-    raw_socket.sendto(ip_header + tcp_header, (destination_ip, destination_port))
-
-
-def send_port_knock_sequence(destination_ip: str, source_ip: str) -> None:
-    raw_socket = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_RAW)
-    raw_socket.setsockopt(socket.IPPROTO_IP, socket.IP_HDRINCL, 1)
-    try:
-        for knock_index, destination_port in enumerate(KNOCK_PORTS):
-            if knock_index > 0:
-                time.sleep(KNOCK_DELAY_SECONDS)
-            send_single_knock(raw_socket, source_ip, destination_ip, destination_port)
-            print(f"  SYN -> {destination_ip}:{destination_port}")
-    finally:
-        raw_socket.close()
-
-
-def wait_for_connection_ack(
-    recv_socket: socket.socket, hostb_ip: str, timeout_seconds: float
-) -> bool:
-    deadline = time.time() + timeout_seconds
-    while True:
-        remaining = deadline - time.time()
-        if remaining <= 0:
-            return False
-        recv_socket.settimeout(remaining)
-        try:
-            packet, _ = recv_socket.recvfrom(65535)
-        except socket.timeout:
-            return False
-
-        if len(packet) < 40:
-            continue
-        ip_header_length = (packet[0] & 0x0F) * 4
-        if len(packet) < ip_header_length + 20:
-            continue
-        if socket.inet_ntoa(packet[12:16]) != hostb_ip:
-            continue
-
-        tcp_header = packet[ip_header_length:ip_header_length + 20]
-        _src, dst_port, _seq, _ack, _offset, flags, _win, _chk, _urg = struct.unpack(
-            "!HHLLBBHHH", tcp_header
-        )
-        if dst_port != SOURCE_PORT:
-            continue
-        if flags & TCP_ACK_FLAG:
-            return True
-
-
-def connect_to_hostb(destination_ip: str) -> bool:
-    print("\n=== Connect ===")
-    source_ip = detect_source_ip(destination_ip)
-    # Open the recv socket first so we don't miss an ack that arrives
-    # before we finish sending the knocks.
-    recv_socket = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_TCP)
-    try:
-        print(f"knocking {destination_ip} from {source_ip}")
-        send_port_knock_sequence(destination_ip, source_ip)
-        print("sent 3 knock packets, waiting for ack...")
-        if wait_for_connection_ack(recv_socket, destination_ip, ACK_TIMEOUT_SECONDS):
-            print("connection established")
-            return True
-        print("connection failed: no ack from hostb")
-        return False
-    finally:
-        recv_socket.close()
-
-
-def encrypt_identifier(plaintext: int) -> int:
-    return (plaintext ^ PRE_SHARED_KEY) & 0xFFFF
-
-
-def build_icmp_echo_request(identifier_encrypted: int, sequence: int) -> bytes:
-    def packet_with_checksum(checksum_value: int) -> bytes:
+def build_icmp_echo_request(identifier_encrypted, sequence):
+    def with_checksum(checksum):
         header = struct.pack(
             "!BBHHH",
             8,                         # type: echo request
             0,                         # code
-            checksum_value,
+            checksum,
             identifier_encrypted,
             sequence,
         )
         return header + PING_PAYLOAD
-    correct_checksum = compute_checksum(packet_with_checksum(0))
-    return packet_with_checksum(correct_checksum)
+    return with_checksum(compute_checksum(with_checksum(0)))
 
 
-def send_command(destination_ip: str, command_code: int, sequence: int = 1) -> None:
-    source_ip = detect_source_ip(destination_ip)
-    raw_socket = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_RAW)
-    raw_socket.setsockopt(socket.IPPROTO_IP, socket.IP_HDRINCL, 1)
+def encrypt_identifier(plaintext):
+    return (plaintext ^ PRE_SHARED_KEY) & 0xFFFF
+
+
+def open_raw_send_socket():
+    sock = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_RAW)
+    sock.setsockopt(socket.IPPROTO_IP, socket.IP_HDRINCL, 1)
+    return sock
+
+
+# ---------------------------------------------------------------------------
+# FSM state functions
+# ---------------------------------------------------------------------------
+
+def handle_error(ctx: Context):
+    sys.stderr.write(f"\nError: {ctx.error_message}\n")
+    sys.stderr.write(f"Exit Code: {ctx.error_code}\n")
+    sys.exit(ctx.error_code)
+
+
+def parse_arguments(ctx: Context, argv: list[str] | None = None):
+    parser = argparse.ArgumentParser(
+        prog="hosta",
+        description="Control center for the remote administration tool.",
+    )
+    parser.add_argument("-a", dest="hostb_ip", required=True,
+                        metavar="<hostb_ip>",
+                        help="IP address of hostb")
+
+    try:
+        parsed = parser.parse_args(argv)
+    except SystemExit as exc:
+        sys.exit(1 if exc.code else 0)
+
+    ctx.args = HostaArgs(hostb_ip=parsed.hostb_ip)
+
+
+def handle_arguments(ctx: Context):
+    try:
+        socket.inet_aton(ctx.args.hostb_ip)
+    except OSError:
+        ctx.error_message = f"invalid ip address: {ctx.args.hostb_ip}"
+        handle_error(ctx)
+    ctx.destination_ip = ctx.args.hostb_ip
+
+
+def display_menu(ctx: Context) -> str:
+    state_label = "connected" if ctx.connected else "disconnected"
+    print(f"\n--- Menu ({state_label}) ---")
+    for index, label in enumerate(MENU_OPTIONS, start=1):
+        print(f"  {index}) {label}")
+    try:
+        return input("choice> ").strip()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return "exit"
+
+
+def establish_session(ctx: Context):
+    if ctx.connected:
+        print("Already connected.")
+        return
+
+    ctx.source_ip = detect_source_ip(ctx.destination_ip)
+
+    # Open the recv socket first so we don't miss an ack that arrives
+    # before we finish sending the knocks.
+    try:
+        recv_socket = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_TCP)
+        send_socket = open_raw_send_socket()
+    except PermissionError:
+        ctx.error_message = "permission denied (raw sockets require sudo)"
+        handle_error(ctx)
+
+    try:
+        print(f"Knocking {ctx.destination_ip} from {ctx.source_ip}")
+        for index, port in enumerate(KNOCK_PORTS):
+            if index > 0:
+                time.sleep(KNOCK_DELAY_SECONDS)
+            tcp = build_tcp_syn_header(ctx.source_ip, ctx.destination_ip, port)
+            ip = build_ip_header(ctx.source_ip, ctx.destination_ip, 20 + len(tcp))
+            send_socket.sendto(ip + tcp, (ctx.destination_ip, port))
+            print(f"  SYN -> {ctx.destination_ip}:{port}")
+
+        print("Waiting for ack...")
+        deadline = time.time() + ACK_TIMEOUT_SECONDS
+        while True:
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                print("Connection failed: no ack from hostb.")
+                return
+            recv_socket.settimeout(remaining)
+            try:
+                packet, _ = recv_socket.recvfrom(65535)
+            except socket.timeout:
+                print("Connection failed: no ack from hostb.")
+                return
+
+            if len(packet) < 40:
+                continue
+            ip_header_length = (packet[0] & 0x0F) * 4
+            if len(packet) < ip_header_length + 20:
+                continue
+            if socket.inet_ntoa(packet[12:16]) != ctx.destination_ip:
+                continue
+
+            tcp_header = packet[ip_header_length:ip_header_length + 20]
+            _, dst_port, _, _, _, flags, _, _, _ = struct.unpack("!HHLLBBHHH", tcp_header)
+            if dst_port != SOURCE_PORT:
+                continue
+            if flags & TCP_ACK_FLAG:
+                print("Connection established.")
+                ctx.connected = True
+                return
+    finally:
+        recv_socket.close()
+        send_socket.close()
+
+
+def send_command(ctx: Context, command_code: int):
+    if not ctx.connected:
+        print("Not connected. Use option 1 first.")
+        return
+
+    try:
+        raw_socket = open_raw_send_socket()
+    except PermissionError:
+        ctx.error_message = "permission denied (raw sockets require sudo)"
+        handle_error(ctx)
+
     try:
         identifier = encrypt_identifier(command_code)
-        icmp_header = build_icmp_echo_request(identifier, sequence)
-        ip_header = build_ip_header(
-            source_ip, destination_ip, 20 + len(icmp_header), socket.IPPROTO_ICMP
+        sequence = 1
+        icmp = build_icmp_echo_request(identifier, sequence)
+        ip = build_ip_header(
+            ctx.source_ip, ctx.destination_ip,
+            20 + len(icmp), socket.IPPROTO_ICMP,
         )
-        raw_socket.sendto(ip_header + icmp_header, (destination_ip, 0))
+        try:
+            raw_socket.sendto(ip + icmp, (ctx.destination_ip, 0))
+        except OSError as exc:
+            ctx.error_message = f"failed to send command: {exc}"
+            ctx.error_code = 2
+            handle_error(ctx)
+
         print(
-            f"  ICMP -> {destination_ip} "
+            f"ICMP -> {ctx.destination_ip} "
             f"id={identifier:#06x} (cmd={command_code}) seq={sequence}"
         )
+        if command_code == CMD_DISCONNECT:
+            ctx.connected = False
+            print("Disconnect command sent.")
     finally:
         raw_socket.close()
 
 
-def print_menu(connected: bool) -> None:
-    state_label = "connected" if connected else "disconnected"
-    print(f"\n--- hosta menu --- ({state_label})")
-    for index, label in enumerate(MENU_OPTIONS, start=1):
-        print(f"  {index}) {label}")
+if __name__ == "__main__":
+    print("--------------- HOSTA ---------------")
+    ctx = Context()
+    parse_arguments(ctx)
+    handle_arguments(ctx)
 
-
-def main() -> int:
-    if len(sys.argv) != 2:
-        print("Usage: sudo python3 hosta.py <hostb_ip>", file=sys.stderr)
-        return 2
-    destination_ip = sys.argv[1]
-    connected = False
+    print(f"Target: {ctx.destination_ip}")
 
     while True:
-        print_menu(connected)
-        try:
-            choice = input("choice> ").strip()
-        except (EOFError, KeyboardInterrupt):
-            print()
-            return 0
+        choice = display_menu(ctx)
+        if choice == "exit":
+            print("\nExiting.")
+            sys.exit(0)
 
         if choice == "1":
-            if connected:
-                print("already connected")
-                continue
-            try:
-                connected = connect_to_hostb(destination_ip)
-            except PermissionError:
-                print("permission denied (raw sockets require sudo)")
+            print("\nEstablishing session...")
+            establish_session(ctx)
         elif choice == "2":
-            if not connected:
-                print("not connected; use option 1 first")
-                continue
-            print("\n=== Disconnect ===")
-            try:
-                send_command(destination_ip, CMD_DISCONNECT)
-                connected = False
-                print("disconnect command sent")
-            except PermissionError:
-                print("permission denied (raw sockets require sudo)")
+            print("\nSending disconnect command...")
+            send_command(ctx, CMD_DISCONNECT)
         elif choice in {"3", "4", "5", "6", "7", "8"}:
-            print("not implemented yet")
+            print("Not implemented yet.")
         else:
-            print("invalid choice")
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())
+            print("Invalid choice.")

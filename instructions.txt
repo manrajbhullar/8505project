@@ -29,3 +29,23 @@ I also want to encrypt my data before i add it to the fields . First just start 
 
 after this has been established the communication channel. then i can work on transfering a file. when a file is tranferred to my other machine,
 it will get the bytees, encrypt it and then pack it into as many icmp packets it needs with matching sequence numbers and thn the host b will get them in order and decipher it. but first lets just get the disconnect working which first requires the commands to be sent . fwhile host b waits for command depending on what it receives there should be a an if block for each command
+
+step 3
+ok now i want to clean up my code structure a bit. 
+
+i want both program to kind of run like a fsm where it stransitions function to function. so each function iwill have a specific purpose and all code relative tot hat fsm step will stay contained there
+
+right now i have so amny random fucntions in both
+i want to keep the same functionality but reroganzie the code
+
+first make sure u use argeparse in both programs instead of raw command line
+
+for hosta
+have a parse_args function that parses command line args ursing arge parse and then saves them to a context dataclass respsnible for storing program data with a field for it.
+then do ahndle arge for validating them and preparing for use.
+then do a diplay menu function.
+then a establish session fucntion which does th eocnnection using port knocking and sets the conenected flag which is also somethign that would get stored in its own context field.
+then do send_command.
+Also keep a error message thing in context that whenver error occurs it saves tot hat context field and then add a error function that would execute to print it and exit cleanly
+
+for host b do the same parse args, handle args, wait_for_session, estblish_session, listen_for_command, error
