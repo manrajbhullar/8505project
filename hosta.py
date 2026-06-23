@@ -27,7 +27,12 @@ PRE_SHARED_KEY = 0xA5C3
 CMD_DISCONNECT = 1
 CMD_TRANSFER_FILE = 2
 CMD_UNINSTALL = 3
+CMD_RUN_PROGRAM = 4
 ACK_READY = 0xFFFE
+
+# Run-program limits.
+MAX_COMMAND_BYTES = 0xFFFF
+OUTPUT_TIMEOUT_SECONDS = 60.0
 
 # File transfer settings.
 MAX_TRANSFER_BYTES = 0xFFFF                  # file size must fit in one 16-bit identifier
@@ -165,6 +170,83 @@ def send_icmp_identifier(send_socket, source_ip, destination_ip, identifier_encr
     icmp = build_icmp_echo_request(identifier_encrypted, sequence)
     ip = build_ip_header(source_ip, destination_ip, 20 + len(icmp), socket.IPPROTO_ICMP)
     send_socket.sendto(ip + icmp, (destination_ip, 0))
+
+
+def wait_for_ack_ready(recv_socket, source_ip, timeout):
+    """Block until an ICMP echo from source_ip carries ACK_READY in the identifier."""
+    deadline = time.time() + timeout
+    while True:
+        remaining = deadline - time.time()
+        if remaining <= 0:
+            return False
+        recv_socket.settimeout(remaining)
+        try:
+            packet, _ = recv_socket.recvfrom(65535)
+        except socket.timeout:
+            return False
+        if len(packet) < 28:
+            continue
+        ip_header_length = (packet[0] & 0x0F) * 4
+        if len(packet) < ip_header_length + 8:
+            continue
+        if socket.inet_ntoa(packet[12:16]) != source_ip:
+            continue
+        icmp_header = packet[ip_header_length:ip_header_length + 8]
+        icmp_type, _code, _chk, identifier, _seq = struct.unpack("!BBHHH", icmp_header)
+        if icmp_type != 8:
+            continue
+        if decrypt_identifier(identifier) == ACK_READY:
+            return True
+
+
+def receive_byte_stream(recv_socket, source_ip, timeout):
+    """Receive a one-header byte stream (seq=1 size, seq=2..N+1 data) and reassemble."""
+    packets: dict[int, int] = {}
+    byte_count: int | None = None
+    deadline = time.time() + timeout
+
+    while True:
+        remaining = deadline - time.time()
+        if remaining <= 0:
+            break
+        recv_socket.settimeout(remaining)
+        try:
+            packet, _ = recv_socket.recvfrom(65535)
+        except socket.timeout:
+            break
+        if len(packet) < 28:
+            continue
+        ip_header_length = (packet[0] & 0x0F) * 4
+        if len(packet) < ip_header_length + 8:
+            continue
+        if socket.inet_ntoa(packet[12:16]) != source_ip:
+            continue
+        icmp_header = packet[ip_header_length:ip_header_length + 8]
+        icmp_type, _code, _chk, identifier, sequence = struct.unpack("!BBHHH", icmp_header)
+        if icmp_type != 8:
+            continue
+
+        value = decrypt_identifier(identifier)
+        packets[sequence] = value
+        if sequence == 1:
+            byte_count = value
+        if byte_count is not None:
+            expected = 1 + (byte_count + 1) // 2
+            if len(packets) >= expected:
+                break
+
+    if byte_count is None:
+        return None
+    num_chunks = (byte_count + 1) // 2
+    out = bytearray()
+    for i in range(num_chunks):
+        seq = 2 + i
+        if seq not in packets:
+            return None
+        v = packets[seq]
+        out.append((v >> 8) & 0xFF)
+        out.append(v & 0xFF)
+    return bytes(out[:byte_count])
 
 
 # ---------------------------------------------------------------------------
@@ -469,6 +551,100 @@ def transfer_file(ctx: Context):
         send_socket.close()
 
 
+def run_program(ctx: Context):
+    if not ctx.connected:
+        print("Not connected. Use option 1 first.")
+        return
+
+    try:
+        command_text = input("command> ").strip()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return
+    if not command_text:
+        print("Run cancelled: no command given.")
+        return
+
+    command_bytes = command_text.encode("utf-8")
+    command_length = len(command_bytes)
+    if command_length > MAX_COMMAND_BYTES:
+        print(f"Run failed: command too long ({command_length} bytes, max {MAX_COMMAND_BYTES}).")
+        return
+
+    num_command_packets = (command_length + 1) // 2
+    print(f"Command: {command_text!r} ({command_length} bytes, {num_command_packets} packets)")
+
+    try:
+        recv_socket = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_ICMP)
+        send_socket = open_raw_send_socket()
+    except PermissionError:
+        ctx.error_message = "permission denied (raw sockets require sudo)"
+        handle_error(ctx)
+
+    try:
+        try:
+            send_icmp_identifier(
+                send_socket, ctx.source_ip, ctx.destination_ip,
+                encrypt_identifier(CMD_RUN_PROGRAM), 1,
+            )
+        except OSError as exc:
+            ctx.error_message = f"failed to send run request: {exc}"
+            ctx.error_code = 2
+            handle_error(ctx)
+        print(f"Sent run request (cmd={CMD_RUN_PROGRAM}). Waiting for ready ack...")
+
+        if not wait_for_ack_ready(recv_socket, ctx.destination_ip, READY_TIMEOUT_SECONDS):
+            print("Run failed: no ready ack from hostb.")
+            return
+        print("hostb is ready. Sending command...")
+
+        try:
+            send_icmp_identifier(
+                send_socket, ctx.source_ip, ctx.destination_ip,
+                encrypt_identifier(command_length), 1,
+            )
+            if FILE_PACKET_DELAY_SECONDS > 0:
+                time.sleep(FILE_PACKET_DELAY_SECONDS)
+            for chunk_index in range(num_command_packets):
+                sequence = 2 + chunk_index
+                byte_offset = chunk_index * 2
+                high = command_bytes[byte_offset]
+                low = command_bytes[byte_offset + 1] if byte_offset + 1 < command_length else 0
+                chunk_value = (high << 8) | low
+                send_icmp_identifier(
+                    send_socket, ctx.source_ip, ctx.destination_ip,
+                    encrypt_identifier(chunk_value), sequence,
+                )
+                if FILE_PACKET_DELAY_SECONDS > 0:
+                    time.sleep(FILE_PACKET_DELAY_SECONDS)
+        except OSError as exc:
+            ctx.error_message = f"failed to send command bytes: {exc}"
+            ctx.error_code = 2
+            handle_error(ctx)
+
+        print(f"Sent {1 + num_command_packets} packets. Waiting for output...")
+
+        output_bytes = receive_byte_stream(
+            recv_socket, ctx.destination_ip, OUTPUT_TIMEOUT_SECONDS
+        )
+        if output_bytes is None:
+            print("Run failed: timed out or incomplete output from hostb.")
+            return
+
+        try:
+            output_text = output_bytes.decode("utf-8")
+        except UnicodeDecodeError:
+            output_text = output_bytes.decode("utf-8", errors="replace")
+
+        print(f"\n--- Output from hostb ({len(output_bytes)} bytes) ---")
+        if output_text:
+            print(output_text, end="" if output_text.endswith("\n") else "\n")
+        print("--- End ---")
+    finally:
+        recv_socket.close()
+        send_socket.close()
+
+
 if __name__ == "__main__":
     print("--------------- HOSTA ---------------")
     ctx = Context()
@@ -495,7 +671,10 @@ if __name__ == "__main__":
         elif choice == "4":
             print("\nTransferring file to hostb...")
             transfer_file(ctx)
-        elif choice in {"5", "6", "7", "8"}:
+        elif choice == "8":
+            print("\nRunning program on hostb...")
+            run_program(ctx)
+        elif choice in {"5", "6", "7"}:
             print("Not implemented yet.")
         else:
             print("Invalid choice.")
