@@ -408,6 +408,16 @@ def receive_file(ctx: Context):
     sniffer = AsyncSniffer(iface=ctx.iface, filter=BPF_COMMAND, prn=watcher, store=False)
     sniffer.start()
 
+    # AsyncSniffer.start() returns before its background thread has
+    # actually opened the BPF socket. Packets arriving in that window
+    # are silently dropped. Wait for the sniffer to be truly ready
+    # before signalling hosta to start sending.
+    started_event = getattr(sniffer, "started", None)
+    if isinstance(started_event, threading.Event):
+        started_event.wait(timeout=2.0)
+    else:
+        time.sleep(0.3)
+
     source_ip = detect_source_ip(ctx.connected_to)
     try:
         raw_socket = open_raw_send_socket()
