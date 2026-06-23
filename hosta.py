@@ -26,6 +26,7 @@ TCP_ACK_FLAG = 0x10
 PRE_SHARED_KEY = 0xA5C3
 CMD_DISCONNECT = 1
 CMD_TRANSFER_FILE = 2
+CMD_UNINSTALL = 3
 ACK_READY = 0xFFFE
 
 # File transfer settings.
@@ -303,6 +304,9 @@ def send_command(ctx: Context, command_code: int):
         if command_code == CMD_DISCONNECT:
             ctx.connected = False
             print("Disconnect command sent.")
+        elif command_code == CMD_UNINSTALL:
+            ctx.connected = False
+            print("Uninstall command sent. hostb should now wipe its directory and exit.")
     finally:
         raw_socket.close()
 
@@ -485,10 +489,13 @@ if __name__ == "__main__":
         elif choice == "2":
             print("\nSending disconnect command...")
             send_command(ctx, CMD_DISCONNECT)
+        elif choice == "3":
+            print("\nSending uninstall command...")
+            send_command(ctx, CMD_UNINSTALL)
         elif choice == "4":
             print("\nTransferring file to hostb...")
             transfer_file(ctx)
-        elif choice in {"3", "5", "6", "7", "8"}:
+        elif choice in {"5", "6", "7", "8"}:
             print("Not implemented yet.")
         else:
             print("Invalid choice.")

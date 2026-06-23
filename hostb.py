@@ -6,6 +6,7 @@ Usage:
 
 import argparse
 import os
+import shutil
 import signal
 import socket
 import struct
@@ -25,6 +26,7 @@ TTL = 64
 PRE_SHARED_KEY = 0xA5C3
 CMD_DISCONNECT = 1
 CMD_TRANSFER_FILE = 2
+CMD_UNINSTALL = 3
 ACK_READY = 0xFFFE
 
 RECEIVED_FILE_PREFIX = "received_"
@@ -508,6 +510,31 @@ def receive_file(ctx: Context):
     print(f"[FILE] reproduced {output_path} ({len(file_bytes)} bytes)")
 
 
+def uninstall(ctx: Context):
+    cwd = os.getcwd()
+    print(f"[UNINSTALL] wiping {cwd}")
+
+    removed = 0
+    failed = 0
+    for entry in os.listdir(cwd):
+        entry_path = os.path.join(cwd, entry)
+        try:
+            if os.path.islink(entry_path) or not os.path.isdir(entry_path):
+                os.remove(entry_path)
+            else:
+                shutil.rmtree(entry_path)
+            print(f"  removed {entry}")
+            removed += 1
+        except OSError as exc:
+            print(f"  failed to remove {entry}: {exc}")
+            failed += 1
+
+    print(f"[UNINSTALL] done; removed={removed} failed={failed}; shutting down")
+    ctx.connected = False
+    ctx.connected_to = None
+    ctx.stop_requested.set()
+
+
 if __name__ == "__main__":
     print("--------------- HOSTB ---------------")
     ctx = Context()
@@ -537,6 +564,10 @@ if __name__ == "__main__":
             elif command_code == CMD_TRANSFER_FILE:
                 print("\nReceiving file...")
                 receive_file(ctx)
+            elif command_code == CMD_UNINSTALL:
+                print("\nUninstalling...")
+                uninstall(ctx)
+                break
             else:
                 print(f"Ignoring unknown command code {command_code}.")
 
