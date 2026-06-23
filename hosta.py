@@ -150,7 +150,8 @@ def build_icmp_echo_request(identifier_encrypted, sequence):
             identifier_encrypted,
             sequence,
         )
-        return header + PING_PAYLOAD
+        return header
+        # return header + PING_PAYLOAD  # uncomment to mimic Linux ping payload
     return with_checksum(compute_checksum(with_checksum(0)))
 
 
