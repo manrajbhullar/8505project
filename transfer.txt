@@ -1,1 +1,4 @@
 this is my transfer test file.
+  If you still see the same pattern after this change, the next thing to try is the bigger refactor: keep a single sniffer running for the whole
+  session and have the watcher switch between command and file modes internally — that eliminates the warm-up entirely because the sniffer is
+  never torn down between commands. Say the word if you want me to do that.

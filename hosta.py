@@ -28,11 +28,12 @@ CMD_DISCONNECT = 1
 CMD_TRANSFER_FILE = 2
 ACK_READY = 0xFFFE
 
-# File transfer settings.
-MAX_TRANSFER_BYTES = 0xFFFF                  # file size must fit in one 16-bit identifier
-MAX_FILENAME_BYTES = 0xFFFF                  # filename length must fit in one 16-bit identifier
+# File transfer settings (block-based protocol with per-block ack).
+BLOCK_BYTES = 60000                          # bytes per block; well under the 16-bit seq cap
+MAX_FILENAME_BYTES = 0xFF                    # sanity cap for filename length
 READY_TIMEOUT_SECONDS = 5.0
-FILE_PACKET_DELAY_SECONDS = 0.002
+BLOCK_ACK_TIMEOUT_SECONDS = 60.0
+FILE_PACKET_DELAY_SECONDS = 0
 
 # Mimic Linux `ping`: 8-byte timestamp slot (zeroed) + 48 bytes of the
 # 0x10..0x3F filler pattern. hostb ignores this payload — it only reads
@@ -164,6 +165,34 @@ def send_icmp_identifier(send_socket, source_ip, destination_ip, identifier_encr
     icmp = build_icmp_echo_request(identifier_encrypted, sequence)
     ip = build_ip_header(source_ip, destination_ip, 20 + len(icmp), socket.IPPROTO_ICMP)
     send_socket.sendto(ip + icmp, (destination_ip, 0))
+
+
+def wait_for_ready_ack(recv_socket, expected_source_ip, timeout_seconds):
+    deadline = time.time() + timeout_seconds
+    while True:
+        remaining = deadline - time.time()
+        if remaining <= 0:
+            return False
+        recv_socket.settimeout(remaining)
+        try:
+            packet, _ = recv_socket.recvfrom(65535)
+        except socket.timeout:
+            return False
+
+        if len(packet) < 28:
+            continue
+        ip_header_length = (packet[0] & 0x0F) * 4
+        if len(packet) < ip_header_length + 8:
+            continue
+        if socket.inet_ntoa(packet[12:16]) != expected_source_ip:
+            continue
+
+        icmp_header = packet[ip_header_length:ip_header_length + 8]
+        icmp_type, _code, _chk, identifier, _seq = struct.unpack("!BBHHH", icmp_header)
+        if icmp_type != 8:
+            continue
+        if decrypt_identifier(identifier) == ACK_READY:
+            return True
 
 
 # ---------------------------------------------------------------------------
@@ -338,9 +367,6 @@ def transfer_file(ctx: Context):
     if file_size == 0:
         print(f"Transfer skipped: {source_path} is empty.")
         return
-    if file_size > MAX_TRANSFER_BYTES:
-        print(f"Transfer failed: file too large ({file_size} bytes, max {MAX_TRANSFER_BYTES}).")
-        return
 
     filename = os.path.basename(source_path)
     filename_bytes = filename.encode("utf-8")
@@ -349,14 +375,18 @@ def transfer_file(ctx: Context):
         print(f"Transfer failed: invalid filename '{filename}' ({filename_length} bytes)")
         return
 
-    num_filename_packets = (filename_length + 1) // 2
-    num_data_packets = (file_size + 1) // 2
-    print(f"File: {source_path}")
-    print(f"  Name:     '{filename}' ({filename_length} bytes, {num_filename_packets} packets)")
-    print(f"  Contents: {file_size} bytes ({num_data_packets} packets)")
+    # Stream = [filename_length (2-byte BE)] + [filename utf-8] + [file data].
+    # That whole stream is what we split into blocks; hostb reverses the
+    # split on the other side.
+    stream = struct.pack(">H", filename_length) + filename_bytes + file_bytes
+    stream_size = len(stream)
+    num_blocks = (stream_size + BLOCK_BYTES - 1) // BLOCK_BYTES
 
-    # Open the ICMP recv socket first so we don't miss the ready-ack that
-    # may arrive before we return from sending the command.
+    print(f"File: {source_path}")
+    print(f"  Name:    '{filename}' ({filename_length} bytes)")
+    print(f"  Content: {file_size} bytes")
+    print(f"  Stream:  {stream_size} bytes -> {num_blocks} block(s) of <= {BLOCK_BYTES} bytes")
+
     try:
         recv_socket = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_ICMP)
         send_socket = open_raw_send_socket()
@@ -364,101 +394,62 @@ def transfer_file(ctx: Context):
         ctx.error_message = "permission denied (raw sockets require sudo)"
         handle_error(ctx)
 
-    try:
-        request_identifier = encrypt_identifier(CMD_TRANSFER_FILE)
+    def send_or_die(identifier_value: int, sequence: int, label: str) -> None:
         try:
             send_icmp_identifier(
-                send_socket, ctx.source_ip, ctx.destination_ip, request_identifier, 1
+                send_socket, ctx.source_ip, ctx.destination_ip,
+                encrypt_identifier(identifier_value), sequence,
             )
         except OSError as exc:
-            ctx.error_message = f"failed to send transfer request: {exc}"
+            ctx.error_message = f"failed to send {label}: {exc}"
             ctx.error_code = 2
             handle_error(ctx)
+
+    try:
+        # 1. Initial handshake: CMD_TRANSFER_FILE -> ACK_READY.
+        send_or_die(CMD_TRANSFER_FILE, 1, "transfer request")
         print(f"Sent transfer request (cmd={CMD_TRANSFER_FILE}). Waiting for ready ack...")
 
-        deadline = time.time() + READY_TIMEOUT_SECONDS
-        ready = False
-        while True:
-            remaining = deadline - time.time()
-            if remaining <= 0:
-                break
-            recv_socket.settimeout(remaining)
-            try:
-                packet, _ = recv_socket.recvfrom(65535)
-            except socket.timeout:
-                break
-
-            if len(packet) < 28:
-                continue
-            ip_header_length = (packet[0] & 0x0F) * 4
-            if len(packet) < ip_header_length + 8:
-                continue
-            if socket.inet_ntoa(packet[12:16]) != ctx.destination_ip:
-                continue
-
-            icmp_header = packet[ip_header_length:ip_header_length + 8]
-            icmp_type, _code, _chk, identifier, _seq = struct.unpack("!BBHHH", icmp_header)
-            if icmp_type != 8:
-                continue
-            if decrypt_identifier(identifier) == ACK_READY:
-                ready = True
-                break
-
-        if not ready:
+        if not wait_for_ready_ack(recv_socket, ctx.destination_ip, READY_TIMEOUT_SECONDS):
             print("Transfer failed: no ready ack from hostb.")
             return
+        print("hostb is ready. Sending blocks...")
 
-        print("hostb is ready. Sending file...")
+        # 2. Per-block loop: send block header (seq=1) + data (seq=2..K+1),
+        #    then wait for ACK_READY before sending the next block.
+        for block_index in range(num_blocks):
+            block_data = stream[block_index * BLOCK_BYTES:(block_index + 1) * BLOCK_BYTES]
+            block_size = len(block_data)
+            num_data_packets = (block_size + 1) // 2
 
-        def send_chunked(source: bytes, start_sequence: int, label: str) -> int:
-            length = len(source)
-            num_packets = (length + 1) // 2
-            for chunk_index in range(num_packets):
-                sequence = start_sequence + chunk_index
+            send_or_die(block_size, 1, f"block {block_index + 1} header")
+            if FILE_PACKET_DELAY_SECONDS > 0:
+                time.sleep(FILE_PACKET_DELAY_SECONDS)
+
+            for chunk_index in range(num_data_packets):
+                sequence = chunk_index + 2
                 byte_offset = chunk_index * 2
-                high = source[byte_offset]
-                low = source[byte_offset + 1] if byte_offset + 1 < length else 0
-                chunk_value = (high << 8) | low
-                try:
-                    send_icmp_identifier(
-                        send_socket, ctx.source_ip, ctx.destination_ip,
-                        encrypt_identifier(chunk_value), sequence,
-                    )
-                except OSError as exc:
-                    ctx.error_message = f"failed to send {label} packet {sequence}: {exc}"
-                    ctx.error_code = 2
-                    handle_error(ctx)
+                high = block_data[byte_offset]
+                low = block_data[byte_offset + 1] if byte_offset + 1 < block_size else 0
+                send_or_die((high << 8) | low, sequence, f"block {block_index + 1} seq={sequence}")
                 if FILE_PACKET_DELAY_SECONDS > 0:
                     time.sleep(FILE_PACKET_DELAY_SECONDS)
-            return num_packets
 
-        # Header: seq=1 filename length, seq=2 file size.
-        try:
-            send_icmp_identifier(
-                send_socket, ctx.source_ip, ctx.destination_ip,
-                encrypt_identifier(filename_length), 1,
+            print(
+                f"  Block {block_index + 1}/{num_blocks}: sent {block_size} bytes "
+                f"({num_data_packets + 1} packets); waiting for ack..."
             )
-            if FILE_PACKET_DELAY_SECONDS > 0:
-                time.sleep(FILE_PACKET_DELAY_SECONDS)
-            send_icmp_identifier(
-                send_socket, ctx.source_ip, ctx.destination_ip,
-                encrypt_identifier(file_size), 2,
-            )
-            if FILE_PACKET_DELAY_SECONDS > 0:
-                time.sleep(FILE_PACKET_DELAY_SECONDS)
-        except OSError as exc:
-            ctx.error_message = f"failed to send header packet: {exc}"
-            ctx.error_code = 2
-            handle_error(ctx)
+            if not wait_for_ready_ack(
+                recv_socket, ctx.destination_ip, BLOCK_ACK_TIMEOUT_SECONDS
+            ):
+                print(f"Transfer failed: no ack for block {block_index + 1}.")
+                return
 
-        # seq=3..M+2 filename bytes, then seq=M+3..M+2+P file bytes.
-        sent_filename = send_chunked(filename_bytes, 3, "filename")
-        send_chunked(file_bytes, 3 + sent_filename, "data")
-
-        total_packets = 2 + num_filename_packets + num_data_packets
+        # 3. End-of-transfer marker: block header with size=0.
+        send_or_die(0, 1, "end-of-transfer marker")
         print(
-            f"Transfer complete: sent {total_packets} ICMP packets "
-            f"({filename_length} byte name + {file_size} byte file)."
+            f"Transfer complete: sent {num_blocks} block(s), "
+            f"{stream_size} bytes including metadata."
         )
     finally:
         recv_socket.close()
