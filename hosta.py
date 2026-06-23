@@ -47,6 +47,8 @@ MAX_TRANSFER_BYTES = 0xFFFFFFFF              # 32-bit file size split across 2 m
 MAX_FILENAME_BYTES = 0xFFFF                  # filename length still fits one 16-bit identifier
 CHUNK_PACKETS = 1024
 CHUNK_BYTES = CHUNK_PACKETS * 2
+CHUNK_PACKET_DELAY_SECONDS = 0.0001       # 100us pacing inside a chunk
+RECV_BUFFER_BYTES = 8 * 1024 * 1024       # ask kernel for big recv buffer
 READY_TIMEOUT_SECONDS = 5.0
 META_ACK_TIMEOUT_SECONDS = 5.0
 CHUNK_ACK_TIMEOUT_SECONDS = 5.0
@@ -195,6 +197,24 @@ def open_raw_send_socket():
     return sock
 
 
+def open_raw_icmp_recv_socket():
+    """Open SOCK_RAW for ICMP with a fat receive buffer so a burst of
+    chunk packets won't overflow the kernel queue before Python drains it."""
+    sock = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_ICMP)
+    force_opt = getattr(socket, "SO_RCVBUFFORCE", None)
+    if force_opt is not None:
+        try:
+            sock.setsockopt(socket.SOL_SOCKET, force_opt, RECV_BUFFER_BYTES)
+            return sock
+        except OSError:
+            pass
+    try:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, RECV_BUFFER_BYTES)
+    except OSError:
+        pass
+    return sock
+
+
 def send_icmp_identifier(send_socket, source_ip, destination_ip, identifier_encrypted, sequence):
     icmp = build_icmp_echo_request(identifier_encrypted, sequence)
     ip = build_ip_header(source_ip, destination_ip, 20 + len(icmp), socket.IPPROTO_ICMP)
@@ -262,11 +282,15 @@ def wait_for_ack(recv_socket, source_ip, key, expected_identifier, expected_sequ
 
 def send_chunk(send_socket, source_ip, destination_ip, key, chunk_index, chunk_bytes):
     """Send one chunk: header packet (seq=CHUNK_HEADER_SEQ, id=chunk_index)
-    followed by data packets seq=1..N each carrying two file bytes."""
+    followed by data packets seq=1..N each carrying two file bytes.
+    A tiny per-packet delay keeps us from overrunning the device queue
+    on the sender or the recv socket buffer on the receiver."""
     send_icmp_identifier(
         send_socket, source_ip, destination_ip,
         encrypt_identifier(chunk_index, key), CHUNK_HEADER_SEQ,
     )
+    if CHUNK_PACKET_DELAY_SECONDS > 0:
+        time.sleep(CHUNK_PACKET_DELAY_SECONDS)
     chunk_length = len(chunk_bytes)
     num_packets = (chunk_length + 1) // 2
     for packet_index in range(num_packets):
@@ -278,6 +302,8 @@ def send_chunk(send_socket, source_ip, destination_ip, key, chunk_index, chunk_b
             send_socket, source_ip, destination_ip,
             encrypt_identifier(word, key), packet_index + 1,
         )
+        if CHUNK_PACKET_DELAY_SECONDS > 0:
+            time.sleep(CHUNK_PACKET_DELAY_SECONDS)
 
 
 def receive_byte_stream(recv_socket, source_ip, key, timeout):
@@ -531,7 +557,7 @@ def transfer_file(ctx: Context):
 
     # Open the ICMP recv socket first so we don't miss any acks.
     try:
-        recv_socket = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_ICMP)
+        recv_socket = open_raw_icmp_recv_socket()
         send_socket = open_raw_send_socket()
     except PermissionError:
         ctx.error_message = "permission denied (raw sockets require sudo)"

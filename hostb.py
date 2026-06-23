@@ -44,6 +44,7 @@ CHUNK_BYTES = CHUNK_PACKETS * 2
 METADATA_TIMEOUT_SECONDS = 10.0
 CHUNK_RECV_TIMEOUT_SECONDS = 10.0
 END_DRAIN_TIMEOUT_SECONDS = 3.0
+RECV_BUFFER_BYTES = 8 * 1024 * 1024       # fat recv buffer to absorb chunk bursts
 
 # Reserved sequence values matching hosta.
 CHUNK_HEADER_SEQ = 0
@@ -192,6 +193,24 @@ def decrypt_identifier(ciphertext, key):
 def open_raw_send_socket():
     sock = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_RAW)
     sock.setsockopt(socket.IPPROTO_IP, socket.IP_HDRINCL, 1)
+    return sock
+
+
+def open_raw_icmp_recv_socket():
+    """Open SOCK_RAW for ICMP with a fat receive buffer so a burst of
+    chunk packets won't overflow the kernel queue before Python drains it."""
+    sock = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_ICMP)
+    force_opt = getattr(socket, "SO_RCVBUFFORCE", None)
+    if force_opt is not None:
+        try:
+            sock.setsockopt(socket.SOL_SOCKET, force_opt, RECV_BUFFER_BYTES)
+            return sock
+        except OSError:
+            pass
+    try:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, RECV_BUFFER_BYTES)
+    except OSError:
+        pass
     return sock
 
 
@@ -436,8 +455,8 @@ def receive_metadata(recv_socket, source_ip, key, timeout):
 
 def receive_chunk(recv_socket, send_socket, source_ip, my_ip, key,
                   expected_chunk_index, expected_packets, chunks_written, timeout):
-    """Receive a single chunk worth of data packets. Returns the assembled bytes
-    (length = 2 * expected_packets, caller trims) or None on timeout.
+    """Receive a single chunk worth of data packets. Returns (bytes, None) on success
+    or (None, missing_count) on timeout so the caller can log how much was lost.
 
     Handles three cases inline:
       * Duplicate chunk header for an already-written chunk -> re-ACK and keep waiting.
@@ -451,7 +470,7 @@ def receive_chunk(recv_socket, send_socket, source_ip, my_ip, key,
         remaining = deadline - time.time()
         result = _read_icmp_echo(recv_socket, source_ip, remaining)
         if result is None:
-            return None
+            return None, expected_packets - len(packets)
         if result == ():
             continue
         sequence, identifier = result
@@ -479,10 +498,10 @@ def receive_chunk(recv_socket, send_socket, source_ip, my_ip, key,
                     v = packets.get(i)
                     if v is None:
                         # Should not happen because the count check passed.
-                        return None
+                        return None, expected_packets - len(packets)
                     out.append((v >> 8) & 0xFF)
                     out.append(v & 0xFF)
-                return bytes(out)
+                return bytes(out), None
 
 
 def drain_for_end(recv_socket, send_socket, source_ip, my_ip, key, chunks_written, timeout):
@@ -634,7 +653,7 @@ def receive_file(ctx: Context):
     # Open the raw recv socket BEFORE sending ACK_READY so we don't miss
     # the first metadata packets that arrive right after hosta sees the ack.
     try:
-        recv_socket = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_ICMP)
+        recv_socket = open_raw_icmp_recv_socket()
         send_socket = open_raw_send_socket()
     except PermissionError:
         ctx.error_message = "permission denied (raw sockets require sudo)"
@@ -696,13 +715,14 @@ def receive_file(ctx: Context):
             chunk_byte_count = min(CHUNK_BYTES, file_size - chunk_index * CHUNK_BYTES)
             expected_packets = (chunk_byte_count + 1) // 2
 
-            chunk_bytes = receive_chunk(
+            chunk_bytes, missing = receive_chunk(
                 recv_socket, send_socket, ctx.connected_to, source_ip, ctx.key,
                 chunk_index, expected_packets, chunks_written,
                 CHUNK_RECV_TIMEOUT_SECONDS,
             )
             if chunk_bytes is None:
-                print(f"[FILE] chunk {chunk_index} receive failed; aborting")
+                print(f"[FILE] chunk {chunk_index} receive failed "
+                      f"(missing {missing}/{expected_packets} packets); aborting")
                 file_handle.close()
                 file_handle = None
                 try:
