@@ -1,55 +1,182 @@
-Im creating a remote administration tool for two local personal machines on my network
-I also want to practice my coding skills so im taking a diff approach and creating my own protocols and will be using raw sockets/
-My first step is to estblush a connection with my second machine through port knocking.
- the program im making which will be my own internal admisistration tool.
+PROJECT OVERVIEW
+================
 
-There will be two programs hosta and host b. Host a will be the control center where i will be able to connect to host b by first port knocking as i dont want to leav ports open on my other machine.
-it sends 3 syn packets to specific ports which host b recognizes using scapy. when it receives these three it means they ar eboth conencted now. which means host b will now transition from lookin for port knocks to instead no process incoming commands from hosta.
+This is my personal remote-administration tool for two machines I own on my local
+network. Both run Linux. I built it from scratch instead of using SSH because I
+want practice writing custom protocols with raw sockets, and because I want
+hostb to look closed to anyone scanning it.
 
-Right now i jsut ahave  basic portnkocking connection thing setup for both but i want to now change it to what my end context will be as that ws hust a test code to see if port knocking works at a fundamental level.
+There are two programs:
+  - hosta.py: control center. I run this on my laptop. It shows a menu.
+  - hostb.py: listener daemon. I run this on the other machine. It sniffs.
 
-I need hosta to display a mmenu when it starts. it will hav numbered options of connect to hostb, disconnect from hostb, uninstall from hostb, transfer ifle to hostb, transfer a file from hostb, watch file on hostb, watch a directory on hostb, run a program on hostb
+Both need sudo (raw sockets). Run as:
+  sudo python3 hosta.py -a <hostb_ip>
+  sudo python3 hostb.py -i <interface>
 
-when u start the hosta program it will keep presenting this menu. for now just make the menu so it displays and then link my existing code to the connect option. when i press 1 and enter it should inistate the port knocking sendin the packets. for host b when i stats it should just automatcially look for the port knoc packets first thing as t does now. 
 
-when i press connect from the menu. it should jump intot he connect tage and print out it sent the three packets and then add aconfirmation coming back from host b which it doesnt have right now saying connection established. use raw socket to send the ack and then process it in the connection phase. once connected succefully or if it fails thenr eturn tot the menu so i can enter my next option.
+DESIGN RULES I CARE ABOUT
+=========================
 
-u dont have to code the othe rmenu options yet. 
+1. Raw sockets only. No TCP sockets via the normal API, no HTTP, no SSH.
+2. Data travels in IP/TCP/ICMP HEADER FIELDS, never in packet payloads.
+   I do this to practice repurposing header fields and to imagine a setting
+   where the payload can't be read.
+3. Identifier-field data is XOR-encrypted with a 16-bit pre-shared key
+   (PRE_SHARED_KEY = 0xA5C3). It's barely encryption — that's deliberate
+   for now. Sequence numbers are cleartext.
+4. ICMP packets we send mimic real Linux `ping` exactly: type 8 echo request
+   with an 8-byte zeroed timestamp slot + the 0x10..0x3F filler pattern (56
+   total payload bytes). hostb ignores the payload but on the wire we look
+   like normal ping traffic (98 bytes with ethernet header, not 42).
+5. hostb should appear dark on the knock ports (use iptables DROP for true
+   stealth: `iptables -A INPUT -p tcp -m multiport --dports 7000,8000,9000 -j DROP`).
 
-step 2
-now that the menu has been added. for the other options to work i first need to establsha communication channel.
-i want to use raw sockets and i do not want to use payloads to commnucate. i want my two personal machines o commuicate using ehader fields 
-instead. I want to use the icmp identifier and sequence fields. The identified field will represent the data im sending, and the sequence will be the packet order it comes in . if it requireds say 100 packets to fit the data
-into the identifier field thent he sequence for each packet can be represtended int he other field.
-Im doing it this way because i want to practice for a situation where my compute cant read the payload and also repurpose those header fields to save data and overal practice my networking raw socket ability.
 
-for example, the first thing i will be sending through this channel would the command. for example, if i send 2 for disconnect. the host b should be able to decipher receiving the command and then deciphering that a 2 was received then initiate the disconnecion process.
-so after ost a port nocks succssfully, host b should have flag for CONNECTED=true then transition to a wait for command phase. then when it receives it decipher it from the icmp identfier and sequence field.
-I also want to encrypt my data before i add it to the fields . First just start with the disconnect command which will send an encrypted '1' fit into the icmp idtenfier field with a sequence of 1 int he sequence field indicating its the first one. no need to encrypt the sequence number.
+CODE STRUCTURE (BOTH FILES)
+===========================
 
-after this has been established the communication channel. then i can work on transfering a file. when a file is tranferred to my other machine,
-it will get the bytees, encrypt it and then pack it into as many icmp packets it needs with matching sequence numbers and thn the host b will get them in order and decipher it. but first lets just get the disconnect working which first requires the commands to be sent . fwhile host b waits for command depending on what it receives there should be a an if block for each command
+Each file is organized like a small FSM. Reference style: my earlier
+steg-encode.py and steg-decode.py tools in this same repo — use those as
+the house style.
 
-step 3
-ok now i want to clean up my code structure a bit. 
+  - A `Context` dataclass holds args + runtime state + error_message + error_code.
+  - Step functions take `ctx: Context` and modify it.
+  - Errors: set ctx.error_message (and ctx.error_code if not 1) and call
+    handle_error(ctx), which writes to stderr and sys.exit()s.
+  - argparse with flag style (-a, -i), `prog=`, `metavar=`. The SystemExit
+    catch normalizes argparse's exit-2 to exit-1.
+  - Module orchestration lives in `if __name__ == "__main__":`, not a main()
+    function, with banner headers and "\nXxx..." section markers.
 
-i want both program to kind of run like a fsm where it stransitions function to function. so each function iwill have a specific purpose and all code relative tot hat fsm step will stay contained there
 
-right now i have so amny random fucntions in both
-i want to keep the same functionality but reroganzie the code
+CONNECTION: PORT KNOCKING
+=========================
 
-first make sure u use argeparse in both programs instead of raw command line
+KNOCK_PORTS = (7000, 8000, 9000)
+SOURCE_PORT = 54321 (hosta's source port on outgoing knocks + the port the ACK
+                     comes back to)
 
-for hosta
-have a parse_args function that parses command line args ursing arge parse and then saves them to a context dataclass respsnible for storing program data with a field for it.
-then do ahndle arge for validating them and preparing for use.
-then do a diplay menu function.
-then a establish session fucntion which does th eocnnection using port knocking and sets the conenected flag which is also somethign that would get stored in its own context field.
-then do send_command.
-Also keep a error message thing in context that whenver error occurs it saves tot hat context field and then add a error function that would execute to print it and exit cleanly
+Flow:
+  1. hosta sends 3 raw TCP SYN packets to those three ports in order, ~100ms apart.
+  2. hostb scapy AsyncSniffer (BPF filter for SYN-only on those three ports)
+     tracks per-source-IP progress via KnockWatcher. 5s timeout if knocks are
+     too spread out.
+  3. On third success hostb sends a raw TCP ACK back: src port 9000, dst port
+     54321, ACK flag only. (Wire-level forged — not a real TCP handshake.)
+  4. hosta listens on a raw IPPROTO_TCP socket for that ACK from hostb's IP
+     destined for SOURCE_PORT. Once seen, ctx.connected = True.
 
-for host b do the same parse args, handle args, wait_for_session, estblish_session, listen_for_command, error
+Quirk: hosta's kernel will fire a RST in response to the ACK because port
+54321 isn't really bound. Harmless (our raw socket already captured the ACK).
+To suppress: iptables -A OUTPUT -p tcp --tcp-flags RST RST --sport 54321 -j DROP.
 
-step 4
-lets do the trasnfer a file to host b now. i wil add a transfer.txt file, i want u to now write the code that if option tranfer a file to hot b command is sent, host b sends an ack saying its ready for it. 
-then it packs the txt file depending on how big it is into however many packets it needs to bfit into the identifier field and numbers the pckets send it over and host b reeives them all and reproduces the file in its main directory
+
+COMMAND CHANNEL (POST-CONNECTION)
+=================================
+
+All commands and bulk data go over ICMP echo requests. Identifier carries the
+data (encrypted), sequence carries packet ordering.
+
+Command codes:
+  CMD_DISCONNECT     = 1
+  CMD_TRANSFER_FILE  = 2
+  CMD_UNINSTALL      = 3
+  CMD_RUN_PROGRAM    = 4
+  ACK_READY          = 0xFFFE   (hostb signals "I'm ready for the data stream")
+
+Two protocols for bulk data:
+
+  ByteStreamWatcher (single-header, used by run_program):
+    seq=1:        byte_count
+    seq=2..N+1:   data, 2 bytes per packet
+
+  FileReceiveWatcher (two-header, used by file transfer):
+    seq=1:        filename_length
+    seq=2:        file_size
+    seq=3..M+2:   filename bytes, 2 per packet
+    seq=M+3..end: file bytes,     2 per packet
+
+Receivers key all packets by sequence number so out-of-order delivery is fine.
+Each chunk is `(byte_high << 8) | byte_low`, encrypted via XOR with the
+pre-shared key. The receiver truncates the reassembled buffer to the exact
+declared length so odd-sized inputs don't carry padding.
+
+
+MENU
+====
+
+hosta loops the menu after each action.
+
+  1) Connect to hostb         — implemented (port knock + wait for raw ACK)
+  2) Disconnect from hostb    — implemented (CMD_DISCONNECT). hostb drops back
+                                to wait_for_session.
+  3) Uninstall from hostb     — implemented (CMD_UNINSTALL). hostb wipes its
+                                CWD (shutil.rmtree subdirs, os.remove files)
+                                then sets stop_requested and exits. WARNING:
+                                this wipes whatever directory hostb was started
+                                from. Don't launch from the project source dir.
+  4) Transfer file to hostb   — implemented. Prompts for a path, uses
+                                os.path.basename so absolute paths don't leak,
+                                sends filename + bytes. hostb saves as
+                                received_<safe_basename>. Works for any file
+                                type (binary or text). Cap 64KB.
+  5) Transfer file FROM hostb — NOT implemented yet.
+  6) Watch file on hostb      — NOT implemented yet.
+  7) Watch directory on hostb — NOT implemented yet.
+  8) Run program on hostb     — implemented. Prompts for a shell command,
+                                ships it to hostb, hostb runs via
+                                subprocess.run(shell=True, capture_output=True,
+                                timeout=30s), ships stdout+stderr back, hosta
+                                decodes UTF-8 (errors=replace for binary) and
+                                prints between markers. Cap 64KB each way.
+
+
+IMPLEMENTATION GOTCHAS WE'VE ALREADY HIT
+========================================
+
+- scapy AsyncSniffer.start() returns BEFORE the BPF socket is open. Packets
+  arriving in the ~10-50ms window get silently dropped. Fix: after start(),
+  wait on `sniffer.started` (Event in scapy >=2.5) or fall back to time.sleep(0.3).
+  We do this in receive_file and run_program before sending ACK_READY, so
+  hosta doesn't start firing data while hostb is still warming up.
+
+- When hosta sends ICMP to hostb, hostb's kernel auto-replies with echo-reply
+  (type 0). Our BPFs filter type 8 only, so they're ignored. Same when hostb
+  sends ICMP to hosta — kernel reply is harmless noise.
+
+- subprocess.run with shell=True and timeout: bash -c "cmd" exec-optimizes into
+  the command directly (same PID), so the SIGKILL from timeout actually kills
+  the target command. No zombies, no orphans, in practice.
+
+
+THINGS LEFT OPEN / DECISIONS TO MAKE
+====================================
+
+- Encryption is still static XOR with a 16-bit key. Identical plaintext at
+  the same sequence number always produces identical ciphertext. Considered
+  upgrading to a per-packet keystream like SHA256(key || seq) → XOR.
+- No reliability layer. Lost packets cause hangs until timeout. Could add
+  per-packet acks + retransmits later, but it complicates the protocol.
+- 64KB cap on file size and on command output comes from using a single
+  16-bit identifier as the size header. Going larger needs a 2-packet size
+  header (32-bit total).
+- The sniffer-warm-up race could be eliminated entirely by keeping one
+  sniffer running for the whole session and switching the watcher's mode
+  (command vs file vs byte-stream) internally. Haven't refactored to that yet
+  because the warm-up sleep works.
+- Menu options 5/6/7 are unimplemented and I don't have firm designs yet.
+  My intuition: "transfer file from hostb" mirrors option 4 in reverse;
+  "watch file/directory" probably uses inotify on hostb and streams events
+  back over the byte-stream protocol.
+
+
+OTHER FILES IN THE REPO (REFERENCE ONLY)
+========================================
+
+- steg-encode.py / steg-decode.py: my earlier project. AES-256-GCM-encrypted
+  LSB steganography over PNG. These define the code style I'm matching:
+  Context dataclass, parse_arguments/handle_arguments/handle_error,
+  banner + section prints in __main__.
+- useradd.py: unrelated experiment, ignore.
+- pyproject.toml / uv.lock: deps (scapy, pillow, pycryptodome, etc.)
