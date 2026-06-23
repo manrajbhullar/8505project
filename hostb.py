@@ -31,7 +31,7 @@ CMD_UNINSTALL = 3
 CMD_RUN_PROGRAM = 4
 ACK_READY = 0xFFFE
 
-RECEIVED_FILE_PREFIX = "received_"
+RECEIVED_DIRECTORY = "received"
 RECEIVED_FALLBACK_NAME = "received_file"
 FILE_TRANSFER_TIMEOUT_SECONDS = 10.0
 
@@ -599,9 +599,10 @@ def receive_file(ctx: Context):
     safe_name = os.path.basename(decoded_name.replace("\\", "/"))
     if not safe_name or safe_name in (".", "..") or "\x00" in safe_name:
         safe_name = RECEIVED_FALLBACK_NAME
-    output_path = RECEIVED_FILE_PREFIX + safe_name
+    output_path = os.path.join(RECEIVED_DIRECTORY, safe_name)
 
     try:
+        os.makedirs(RECEIVED_DIRECTORY, exist_ok=True)
         with open(output_path, "wb") as f:
             f.write(file_bytes)
     except OSError as exc:

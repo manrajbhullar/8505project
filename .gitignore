@@ -1,5 +1,6 @@
-# Custom folders
 send/
+received/
+received*
 
 # Python
 __pycache__/
