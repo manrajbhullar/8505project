@@ -30,7 +30,8 @@ ACK_READY = 0xFFFE
 RECEIVED_FILE_PREFIX = "received_"
 RECEIVED_FALLBACK_NAME = "received_file"
 INACTIVITY_TIMEOUT_SECONDS = 5.0
-RECV_BUFFER_BYTES = 64 * 1024 * 1024          # request a 64 MB kernel recv buffer for file phase
+RECV_BUFFER_BYTES = 256 * 1024 * 1024         # request a 256 MB kernel recv buffer for file phase
+SO_RCVBUFFORCE = 33                           # Linux: bypass net.core.rmem_max (needs root)
 
 # Mimic Linux `ping`: 8-byte timestamp slot (zeroed) + 48 bytes of the
 # 0x10..0x3F filler pattern. hosta ignores this payload — it only reads
@@ -432,11 +433,16 @@ def receive_file(ctx: Context):
         ctx.error_message = "permission denied (raw sockets require sudo)"
         handle_error(ctx)
 
-    # Bump kernel recv buffer to absorb bursts. Capped by net.core.rmem_max.
-    try:
-        recv_socket.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, RECV_BUFFER_BYTES)
-    except OSError:
-        pass
+    # Bump kernel recv buffer to absorb the whole transfer burst. SO_RCVBUFFORCE
+    # bypasses net.core.rmem_max (root only); fall back to SO_RCVBUF if it fails.
+    for opt in (SO_RCVBUFFORCE, socket.SO_RCVBUF):
+        try:
+            recv_socket.setsockopt(socket.SOL_SOCKET, opt, RECV_BUFFER_BYTES)
+            break
+        except OSError:
+            continue
+    actual_rcvbuf = recv_socket.getsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF)
+    print(f"[FILE] kernel recv buffer: {actual_rcvbuf // (1024 * 1024)} MB")
 
     source_ip = detect_source_ip(ctx.connected_to)
     try:
@@ -465,29 +471,38 @@ def receive_file(ctx: Context):
     print(f"[ACK_READY] sent to {ctx.connected_to}")
 
     watcher = FileReceiveWatcher()
-    expected_source_bytes = socket.inet_aton(ctx.connected_to)
+    src = socket.inet_aton(ctx.connected_to)
+    expected_src_int = (src[0] << 24) | (src[1] << 16) | (src[2] << 8) | src[3]
+
+    # Pre-allocated recv buffer + settimeout outside the loop avoids per-packet
+    # allocation and the syscall to update the timeout. recvfrom_into writes
+    # into the existing bytearray rather than producing a new bytes object.
+    buf = bytearray(65535)
+    recv_socket.settimeout(INACTIVITY_TIMEOUT_SECONDS)
+    feed = watcher.feed                                 # local-name caches for speed
+    decrypt = decrypt_identifier
 
     try:
         while not ctx.stop_requested.is_set() and not watcher.complete:
-            recv_socket.settimeout(INACTIVITY_TIMEOUT_SECONDS)
             try:
-                packet, _ = recv_socket.recvfrom(65535)
+                nbytes, _ = recv_socket.recvfrom_into(buf, 65535)
             except socket.timeout:
                 break
 
-            if len(packet) < 28:
+            if nbytes < 28:
                 continue
-            ip_header_length = (packet[0] & 0x0F) * 4
-            if len(packet) < ip_header_length + 8:
+            ihl = (buf[0] & 0x0F) * 4
+            if nbytes < ihl + 8:
                 continue
-            if packet[12:16] != expected_source_bytes:
+            if buf[ihl] != 8:                           # ICMP type: echo request
                 continue
-            if packet[ip_header_length] != 8:           # ICMP type: echo request
+            src_int = (buf[12] << 24) | (buf[13] << 16) | (buf[14] << 8) | buf[15]
+            if src_int != expected_src_int:
                 continue
 
-            identifier = (packet[ip_header_length + 4] << 8) | packet[ip_header_length + 5]
-            wire_seq = (packet[ip_header_length + 6] << 8) | packet[ip_header_length + 7]
-            watcher.feed(decrypt_identifier(identifier), wire_seq)
+            identifier = (buf[ihl + 4] << 8) | buf[ihl + 5]
+            wire_seq = (buf[ihl + 6] << 8) | buf[ihl + 7]
+            feed(decrypt(identifier), wire_seq)
     finally:
         recv_socket.close()
 
