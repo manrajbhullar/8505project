@@ -29,7 +29,7 @@ ACK_READY = 0xFFFE
 
 RECEIVED_FILE_PREFIX = "received_"
 RECEIVED_FALLBACK_NAME = "received_file"
-FILE_TRANSFER_TIMEOUT_SECONDS = 10.0
+INACTIVITY_TIMEOUT_SECONDS = 5.0
 
 # Mimic Linux `ping`: 8-byte timestamp slot (zeroed) + 48 bytes of the
 # 0x10..0x3F filler pattern. hosta ignores this payload — it only reads
@@ -243,11 +243,20 @@ class CommandWatcher:
 class FileReceiveWatcher:
     def __init__(self, expected_source):
         self.expected_source = expected_source
+        self.file_size_hi: int | None = None
+        self.file_size_lo: int | None = None
         self.filename_length: int | None = None
-        self.file_size: int | None = None
-        self.packets: dict[int, int] = {}    # seq -> decrypted 16-bit value
+        self.expected_body: int | None = None
+        self.body_packets: list[int] = []     # decrypted values in arrival order
         self.complete = threading.Event()
         self.lock = threading.Lock()
+        self.last_activity = time.time()
+
+    @property
+    def file_size(self):
+        if self.file_size_hi is None or self.file_size_lo is None:
+            return None
+        return (self.file_size_hi << 16) | self.file_size_lo
 
     def __call__(self, packet):
         if self.complete.is_set():
@@ -261,27 +270,49 @@ class FileReceiveWatcher:
             return
 
         encrypted = int(icmp.id) & 0xFFFF
-        sequence = int(icmp.seq) & 0xFFFF
+        wire_seq = int(icmp.seq) & 0xFFFF
         value = decrypt_identifier(encrypted)
 
         with self.lock:
-            self.packets[sequence] = value
+            self.last_activity = time.time()
 
-            if sequence == 1:
+            # Headers occupy wire seq 1, 2, 3. Each is only treated as a
+            # header the first time it's seen, so the rollover-wrapped
+            # versions for big files fall through into body.
+            if wire_seq == 1 and self.file_size_hi is None:
+                self.file_size_hi = value
+                print(f"[FILE] file size high16: {value:#06x}")
+            elif wire_seq == 2 and self.file_size_lo is None:
+                self.file_size_lo = value
+                print(f"[FILE] file size: {self.file_size} bytes")
+            elif wire_seq == 3 and self.filename_length is None:
                 self.filename_length = value
                 print(f"[FILE] filename length: {value} bytes")
-            elif sequence == 2:
-                self.file_size = value
-                print(f"[FILE] file size: {value} bytes")
             else:
-                print(f"[FILE] seq={sequence} ({len(self.packets)} packets total)")
+                # Body packet in arrival order. LAN delivery is in-order,
+                # so position in body_packets implies logical sequence.
+                self.body_packets.append(value)
+                count = len(self.body_packets)
+                if self.expected_body is not None:
+                    log_interval = max(1000, self.expected_body // 100)
+                    if count % log_interval == 0:
+                        pct = (count * 100) // self.expected_body
+                        print(f"[FILE] received {count}/{self.expected_body} body packets ({pct}%)")
 
-            if self.filename_length is not None and self.file_size is not None:
+            if (self.expected_body is None
+                and self.file_size is not None
+                and self.filename_length is not None):
                 num_filename_packets = (self.filename_length + 1) // 2
                 num_data_packets = (self.file_size + 1) // 2
-                expected_total = 2 + num_filename_packets + num_data_packets
-                if len(self.packets) >= expected_total:
-                    self.complete.set()
+                self.expected_body = num_filename_packets + num_data_packets
+                print(
+                    f"[FILE] expecting {num_filename_packets} filename + "
+                    f"{num_data_packets} data = {self.expected_body} body packets"
+                )
+
+            if (self.expected_body is not None
+                and len(self.body_packets) >= self.expected_body):
+                self.complete.set()
 
 
 # ---------------------------------------------------------------------------
@@ -446,13 +477,12 @@ def receive_file(ctx: Context):
 
     print(f"[ACK_READY] sent to {ctx.connected_to}")
 
-    deadline = time.time() + FILE_TRANSFER_TIMEOUT_SECONDS
     try:
         while (
             sniffer.running
             and not watcher.complete.is_set()
             and not ctx.stop_requested.is_set()
-            and time.time() < deadline
+            and time.time() - watcher.last_activity < INACTIVITY_TIMEOUT_SECONDS
         ):
             time.sleep(0.05)
     finally:
@@ -460,33 +490,26 @@ def receive_file(ctx: Context):
             sniffer.stop(join=True)
 
     if not watcher.complete.is_set():
-        got = len(watcher.packets)
-        print(f"[FILE] transfer incomplete: got {got} packets")
+        got = len(watcher.body_packets)
+        expected = watcher.expected_body if watcher.expected_body is not None else "?"
+        print(f"[FILE] transfer incomplete: got {got}/{expected} body packets")
         return
 
-    def collect_chunks(start_seq: int, count: int, byte_length: int, label: str) -> bytes | None:
+    def pack_values(values, byte_length):
         out = bytearray()
-        for chunk_index in range(count):
-            seq = start_seq + chunk_index
-            if seq not in watcher.packets:
-                print(f"[FILE] missing {label} packet seq={seq}; aborting write")
-                return None
-            value = watcher.packets[seq]
-            out.append((value >> 8) & 0xFF)
-            out.append(value & 0xFF)
+        for v in values:
+            out.append((v >> 8) & 0xFF)
+            out.append(v & 0xFF)
         return bytes(out[:byte_length])
 
     num_filename_packets = (watcher.filename_length + 1) // 2
-    num_data_packets = (watcher.file_size + 1) // 2
 
-    filename_bytes = collect_chunks(3, num_filename_packets, watcher.filename_length, "filename")
-    if filename_bytes is None:
-        return
-    file_bytes = collect_chunks(
-        3 + num_filename_packets, num_data_packets, watcher.file_size, "data"
+    filename_bytes = pack_values(
+        watcher.body_packets[:num_filename_packets], watcher.filename_length
     )
-    if file_bytes is None:
-        return
+    file_bytes = pack_values(
+        watcher.body_packets[num_filename_packets:], watcher.file_size
+    )
 
     try:
         decoded_name = filename_bytes.decode("utf-8")
