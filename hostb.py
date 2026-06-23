@@ -30,6 +30,7 @@ ACK_READY = 0xFFFE
 RECEIVED_FILE_PREFIX = "received_"
 RECEIVED_FALLBACK_NAME = "received_file"
 INACTIVITY_TIMEOUT_SECONDS = 5.0
+RECV_BUFFER_BYTES = 64 * 1024 * 1024          # request a 64 MB kernel recv buffer for file phase
 
 # Mimic Linux `ping`: 8-byte timestamp slot (zeroed) + 48 bytes of the
 # 0x10..0x3F filler pattern. hosta ignores this payload — it only reads
@@ -241,16 +242,17 @@ class CommandWatcher:
 
 
 class FileReceiveWatcher:
-    def __init__(self, expected_source):
-        self.expected_source = expected_source
+    """State for an in-progress file receive. Driven from the raw-socket
+    loop in receive_file via feed(value, wire_seq); single-threaded, so
+    no locking needed."""
+
+    def __init__(self):
         self.file_size_hi: int | None = None
         self.file_size_lo: int | None = None
         self.filename_length: int | None = None
         self.expected_body: int | None = None
-        self.body_packets: list[int] = []     # decrypted values in arrival order
-        self.complete = threading.Event()
-        self.lock = threading.Lock()
-        self.last_activity = time.time()
+        self.body_packets: list[int] = []      # decrypted values in arrival order
+        self.complete = False
 
     @property
     def file_size(self):
@@ -258,61 +260,47 @@ class FileReceiveWatcher:
             return None
         return (self.file_size_hi << 16) | self.file_size_lo
 
-    def __call__(self, packet):
-        if self.complete.is_set():
-            return
-        if not (packet.haslayer(IP) and packet.haslayer(ICMP)):
-            return
-        if packet[IP].src != self.expected_source:
-            return
-        icmp = packet[ICMP]
-        if int(icmp.type) != 8:
+    def feed(self, value: int, wire_seq: int) -> None:
+        if self.complete:
             return
 
-        encrypted = int(icmp.id) & 0xFFFF
-        wire_seq = int(icmp.seq) & 0xFFFF
-        value = decrypt_identifier(encrypted)
+        # Headers occupy wire seq 1, 2, 3. Each is only treated as a
+        # header the first time it's seen, so the rollover-wrapped
+        # versions for big files fall through into body.
+        if wire_seq == 1 and self.file_size_hi is None:
+            self.file_size_hi = value
+            print(f"[FILE] file size high16: {value:#06x}")
+        elif wire_seq == 2 and self.file_size_lo is None:
+            self.file_size_lo = value
+            print(f"[FILE] file size: {self.file_size} bytes")
+        elif wire_seq == 3 and self.filename_length is None:
+            self.filename_length = value
+            print(f"[FILE] filename length: {value} bytes")
+        else:
+            # Body packet in arrival order. LAN delivery is in-order,
+            # so position in body_packets implies logical sequence.
+            self.body_packets.append(value)
+            count = len(self.body_packets)
+            if self.expected_body is not None:
+                log_interval = max(1000, self.expected_body // 100)
+                if count % log_interval == 0:
+                    pct = (count * 100) // self.expected_body
+                    print(f"[FILE] received {count}/{self.expected_body} body packets ({pct}%)")
 
-        with self.lock:
-            self.last_activity = time.time()
+        if (self.expected_body is None
+            and self.file_size is not None
+            and self.filename_length is not None):
+            num_filename_packets = (self.filename_length + 1) // 2
+            num_data_packets = (self.file_size + 1) // 2
+            self.expected_body = num_filename_packets + num_data_packets
+            print(
+                f"[FILE] expecting {num_filename_packets} filename + "
+                f"{num_data_packets} data = {self.expected_body} body packets"
+            )
 
-            # Headers occupy wire seq 1, 2, 3. Each is only treated as a
-            # header the first time it's seen, so the rollover-wrapped
-            # versions for big files fall through into body.
-            if wire_seq == 1 and self.file_size_hi is None:
-                self.file_size_hi = value
-                print(f"[FILE] file size high16: {value:#06x}")
-            elif wire_seq == 2 and self.file_size_lo is None:
-                self.file_size_lo = value
-                print(f"[FILE] file size: {self.file_size} bytes")
-            elif wire_seq == 3 and self.filename_length is None:
-                self.filename_length = value
-                print(f"[FILE] filename length: {value} bytes")
-            else:
-                # Body packet in arrival order. LAN delivery is in-order,
-                # so position in body_packets implies logical sequence.
-                self.body_packets.append(value)
-                count = len(self.body_packets)
-                if self.expected_body is not None:
-                    log_interval = max(1000, self.expected_body // 100)
-                    if count % log_interval == 0:
-                        pct = (count * 100) // self.expected_body
-                        print(f"[FILE] received {count}/{self.expected_body} body packets ({pct}%)")
-
-            if (self.expected_body is None
-                and self.file_size is not None
-                and self.filename_length is not None):
-                num_filename_packets = (self.filename_length + 1) // 2
-                num_data_packets = (self.file_size + 1) // 2
-                self.expected_body = num_filename_packets + num_data_packets
-                print(
-                    f"[FILE] expecting {num_filename_packets} filename + "
-                    f"{num_data_packets} data = {self.expected_body} body packets"
-                )
-
-            if (self.expected_body is not None
-                and len(self.body_packets) >= self.expected_body):
-                self.complete.set()
+        if (self.expected_body is not None
+            and len(self.body_packets) >= self.expected_body):
+            self.complete = True
 
 
 # ---------------------------------------------------------------------------
@@ -433,28 +421,28 @@ def receive_file(ctx: Context):
     if not ctx.connected_to:
         return
 
-    # Start sniffing for file packets before we send the ready-ack, so
-    # we don't miss the size packet that may arrive immediately after.
-    watcher = FileReceiveWatcher(expected_source=ctx.connected_to)
-    sniffer = AsyncSniffer(iface=ctx.iface, filter=BPF_COMMAND, prn=watcher, store=False)
-    sniffer.start()
+    # For the file phase we use a raw ICMP socket instead of scapy:
+    # scapy's per-packet Python parsing tops out around 3-5 kpps, which
+    # makes hostb fall behind on multi-megabyte transfers and the kernel
+    # silently drops packets. Reading SOCK_RAW and decoding only the 8
+    # bytes we need lifts the ceiling well into hosta-bound territory.
+    try:
+        recv_socket = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_ICMP)
+    except PermissionError:
+        ctx.error_message = "permission denied (raw sockets require sudo)"
+        handle_error(ctx)
 
-    # AsyncSniffer.start() returns before its background thread has
-    # actually opened the BPF socket. Packets arriving in that window
-    # are silently dropped. Wait for the sniffer to be truly ready
-    # before signalling hosta to start sending.
-    started_event = getattr(sniffer, "started", None)
-    if isinstance(started_event, threading.Event):
-        started_event.wait(timeout=2.0)
-    else:
-        time.sleep(0.3)
+    # Bump kernel recv buffer to absorb bursts. Capped by net.core.rmem_max.
+    try:
+        recv_socket.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, RECV_BUFFER_BYTES)
+    except OSError:
+        pass
 
     source_ip = detect_source_ip(ctx.connected_to)
     try:
-        raw_socket = open_raw_send_socket()
+        send_socket = open_raw_send_socket()
     except PermissionError:
-        if sniffer.running:
-            sniffer.stop(join=True)
+        recv_socket.close()
         ctx.error_message = "permission denied (raw sockets require sudo)"
         handle_error(ctx)
 
@@ -465,31 +453,45 @@ def receive_file(ctx: Context):
             20 + len(icmp_packet), socket.IPPROTO_ICMP,
         )
         try:
-            raw_socket.sendto(ip_header + icmp_packet, (ctx.connected_to, 0))
+            send_socket.sendto(ip_header + icmp_packet, (ctx.connected_to, 0))
         except OSError as exc:
-            if sniffer.running:
-                sniffer.stop(join=True)
+            recv_socket.close()
             ctx.error_message = f"failed to send ready ack: {exc}"
             ctx.error_code = 2
             handle_error(ctx)
     finally:
-        raw_socket.close()
+        send_socket.close()
 
     print(f"[ACK_READY] sent to {ctx.connected_to}")
 
-    try:
-        while (
-            sniffer.running
-            and not watcher.complete.is_set()
-            and not ctx.stop_requested.is_set()
-            and time.time() - watcher.last_activity < INACTIVITY_TIMEOUT_SECONDS
-        ):
-            time.sleep(0.05)
-    finally:
-        if sniffer.running:
-            sniffer.stop(join=True)
+    watcher = FileReceiveWatcher()
+    expected_source_bytes = socket.inet_aton(ctx.connected_to)
 
-    if not watcher.complete.is_set():
+    try:
+        while not ctx.stop_requested.is_set() and not watcher.complete:
+            recv_socket.settimeout(INACTIVITY_TIMEOUT_SECONDS)
+            try:
+                packet, _ = recv_socket.recvfrom(65535)
+            except socket.timeout:
+                break
+
+            if len(packet) < 28:
+                continue
+            ip_header_length = (packet[0] & 0x0F) * 4
+            if len(packet) < ip_header_length + 8:
+                continue
+            if packet[12:16] != expected_source_bytes:
+                continue
+            if packet[ip_header_length] != 8:           # ICMP type: echo request
+                continue
+
+            identifier = (packet[ip_header_length + 4] << 8) | packet[ip_header_length + 5]
+            wire_seq = (packet[ip_header_length + 6] << 8) | packet[ip_header_length + 7]
+            watcher.feed(decrypt_identifier(identifier), wire_seq)
+    finally:
+        recv_socket.close()
+
+    if not watcher.complete:
         got = len(watcher.body_packets)
         expected = watcher.expected_body if watcher.expected_body is not None else "?"
         print(f"[FILE] transfer incomplete: got {got}/{expected} body packets")

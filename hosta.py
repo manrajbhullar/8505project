@@ -32,7 +32,7 @@ ACK_READY = 0xFFFE
 MAX_TRANSFER_BYTES = 0xFFFFFFFF              # file size fits in 32-bit (two 16-bit header packets)
 MAX_FILENAME_BYTES = 0xFFFF                  # filename length must fit in one 16-bit identifier
 READY_TIMEOUT_SECONDS = 5.0
-FILE_PACKET_DELAY_SECONDS = 0.0001
+FILE_PACKET_DELAY_SECONDS = 0.0               # raise this if hostb starts dropping packets
 
 # Mimic Linux `ping`: 8-byte timestamp slot (zeroed) + 48 bytes of the
 # 0x10..0x3F filler pattern. hostb ignores this payload — it only reads
