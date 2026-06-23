@@ -1,0 +1,17 @@
+Im creating a remote administration tool for two local personal machines on my network
+I also want to practice my coding skills so im taking a diff approach and creating my own protocols and will be using raw sockets/
+My first step is to estblush a connection with my second machine through port knocking.
+I already have the code that does it in hosta.py and hostb but i want to transition it intot he context of the program im making which will be my own internal admisistration tool.
+
+There will be two programs hosta and host b. Host a will be the control center where i will be able to connect to host b by first port knocking as i dont want to leav ports open on my other machine.
+it sends 3 syn packets to specific ports which host b recognizes using scapy. when it receives these three it means they ar eboth conencted now. which means host b will now transition from lookin for port knocks to instead no process incoming commands from hosta.
+
+Right now i jsut ahave  basic portnkocking connection thing setup for both but i want to now change it to what my end context will be as that ws hust a test code to see if port knocking works at a fundamental level.
+
+I need hosta to display a mmenu when it starts. it will hav numbered options of connect to hostb, disconnect from hostb, uninstall from hostb, transfer ifle to hostb, transfer a file from hostb, watch file on hostb, watch a directory on hostb, run a program on hostb
+
+when u start the hosta program it will keep presenting this menu. for now just make the menu so it displays and then link my existing code to the connect option. when i press 1 and enter it should inistate the port knocking sendin the packets. for host b when i stats it should just automatcially look for the port knoc packets first thing as t does now. 
+
+when i press connect from the menu. it should jump intot he connect tage and print out it sent the three packets and then add aconfirmation coming back from host b which it doesnt have right now saying connection established. use raw socket to send the ack and then process it in the connection phase. once connected succefully or if it fails thenr eturn tot the menu so i can enter my next option.
+
+u dont have to code the othe rmenu options yet. 

