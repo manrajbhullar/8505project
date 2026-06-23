@@ -24,6 +24,13 @@ TCP_ACK_FLAG = 0x10
 # sequence field in cleartext.
 PRE_SHARED_KEY = 0xA5C3
 CMD_DISCONNECT = 1
+CMD_TRANSFER_FILE = 2
+ACK_READY = 0xFFFE
+
+# File transfer settings.
+MAX_TRANSFER_BYTES = 0xFFFF                  # file size must fit in one 16-bit identifier
+READY_TIMEOUT_SECONDS = 5.0
+FILE_PACKET_DELAY_SECONDS = 0.002
 
 # Mimic Linux `ping`: 8-byte timestamp slot (zeroed) + 48 bytes of the
 # 0x10..0x3F filler pattern. hostb ignores this payload — it only reads
@@ -141,10 +148,20 @@ def encrypt_identifier(plaintext):
     return (plaintext ^ PRE_SHARED_KEY) & 0xFFFF
 
 
+def decrypt_identifier(ciphertext):
+    return (ciphertext ^ PRE_SHARED_KEY) & 0xFFFF
+
+
 def open_raw_send_socket():
     sock = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_RAW)
     sock.setsockopt(socket.IPPROTO_IP, socket.IP_HDRINCL, 1)
     return sock
+
+
+def send_icmp_identifier(send_socket, source_ip, destination_ip, identifier_encrypted, sequence):
+    icmp = build_icmp_echo_request(identifier_encrypted, sequence)
+    ip = build_ip_header(source_ip, destination_ip, 20 + len(icmp), socket.IPPROTO_ICMP)
+    send_socket.sendto(ip + icmp, (destination_ip, 0))
 
 
 # ---------------------------------------------------------------------------
@@ -270,13 +287,8 @@ def send_command(ctx: Context, command_code: int):
     try:
         identifier = encrypt_identifier(command_code)
         sequence = 1
-        icmp = build_icmp_echo_request(identifier, sequence)
-        ip = build_ip_header(
-            ctx.source_ip, ctx.destination_ip,
-            20 + len(icmp), socket.IPPROTO_ICMP,
-        )
         try:
-            raw_socket.sendto(ip + icmp, (ctx.destination_ip, 0))
+            send_icmp_identifier(raw_socket, ctx.source_ip, ctx.destination_ip, identifier, sequence)
         except OSError as exc:
             ctx.error_message = f"failed to send command: {exc}"
             ctx.error_code = 2
@@ -291,6 +303,133 @@ def send_command(ctx: Context, command_code: int):
             print("Disconnect command sent.")
     finally:
         raw_socket.close()
+
+
+def transfer_file(ctx: Context):
+    if not ctx.connected:
+        print("Not connected. Use option 1 first.")
+        return
+
+    try:
+        source_path = input("file path> ").strip()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return
+    if not source_path:
+        print("Transfer cancelled: no path given.")
+        return
+
+    try:
+        with open(source_path, "rb") as f:
+            file_bytes = f.read()
+    except FileNotFoundError:
+        print(f"Transfer failed: file not found: {source_path}")
+        return
+    except (IsADirectoryError, PermissionError) as exc:
+        print(f"Transfer failed: cannot read {source_path}: {exc}")
+        return
+    except OSError as exc:
+        print(f"Transfer failed: cannot read {source_path}: {exc}")
+        return
+
+    file_size = len(file_bytes)
+    if file_size == 0:
+        print(f"Transfer skipped: {source_path} is empty.")
+        return
+    if file_size > MAX_TRANSFER_BYTES:
+        print(f"Transfer failed: file too large ({file_size} bytes, max {MAX_TRANSFER_BYTES}).")
+        return
+
+    num_data_packets = (file_size + 1) // 2
+    print(f"File: {source_path} ({file_size} bytes, {num_data_packets} data packets)")
+
+    # Open the ICMP recv socket first so we don't miss the ready-ack that
+    # may arrive before we return from sending the command.
+    try:
+        recv_socket = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_ICMP)
+        send_socket = open_raw_send_socket()
+    except PermissionError:
+        ctx.error_message = "permission denied (raw sockets require sudo)"
+        handle_error(ctx)
+
+    try:
+        request_identifier = encrypt_identifier(CMD_TRANSFER_FILE)
+        try:
+            send_icmp_identifier(
+                send_socket, ctx.source_ip, ctx.destination_ip, request_identifier, 1
+            )
+        except OSError as exc:
+            ctx.error_message = f"failed to send transfer request: {exc}"
+            ctx.error_code = 2
+            handle_error(ctx)
+        print(f"Sent transfer request (cmd={CMD_TRANSFER_FILE}). Waiting for ready ack...")
+
+        deadline = time.time() + READY_TIMEOUT_SECONDS
+        ready = False
+        while True:
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                break
+            recv_socket.settimeout(remaining)
+            try:
+                packet, _ = recv_socket.recvfrom(65535)
+            except socket.timeout:
+                break
+
+            if len(packet) < 28:
+                continue
+            ip_header_length = (packet[0] & 0x0F) * 4
+            if len(packet) < ip_header_length + 8:
+                continue
+            if socket.inet_ntoa(packet[12:16]) != ctx.destination_ip:
+                continue
+
+            icmp_header = packet[ip_header_length:ip_header_length + 8]
+            icmp_type, _code, _chk, identifier, _seq = struct.unpack("!BBHHH", icmp_header)
+            if icmp_type != 8:
+                continue
+            if decrypt_identifier(identifier) == ACK_READY:
+                ready = True
+                break
+
+        if not ready:
+            print("Transfer failed: no ready ack from hostb.")
+            return
+
+        print("hostb is ready. Sending file...")
+
+        try:
+            send_icmp_identifier(
+                send_socket, ctx.source_ip, ctx.destination_ip,
+                encrypt_identifier(file_size), 1,
+            )
+        except OSError as exc:
+            ctx.error_message = f"failed to send size packet: {exc}"
+            ctx.error_code = 2
+            handle_error(ctx)
+
+        for chunk_index in range(num_data_packets):
+            sequence = chunk_index + 2
+            byte_offset = chunk_index * 2
+            high = file_bytes[byte_offset]
+            low = file_bytes[byte_offset + 1] if byte_offset + 1 < file_size else 0
+            chunk_value = (high << 8) | low
+            try:
+                send_icmp_identifier(
+                    send_socket, ctx.source_ip, ctx.destination_ip,
+                    encrypt_identifier(chunk_value), sequence,
+                )
+            except OSError as exc:
+                ctx.error_message = f"failed to send data packet {sequence}: {exc}"
+                ctx.error_code = 2
+                handle_error(ctx)
+            if FILE_PACKET_DELAY_SECONDS > 0:
+                time.sleep(FILE_PACKET_DELAY_SECONDS)
+
+        print(f"Transfer complete: sent {num_data_packets + 1} ICMP packets ({file_size} bytes).")
+    finally:
+        recv_socket.close()
+        send_socket.close()
 
 
 if __name__ == "__main__":
@@ -313,7 +452,10 @@ if __name__ == "__main__":
         elif choice == "2":
             print("\nSending disconnect command...")
             send_command(ctx, CMD_DISCONNECT)
-        elif choice in {"3", "4", "5", "6", "7", "8"}:
+        elif choice == "4":
+            print("\nTransferring file to hostb...")
+            transfer_file(ctx)
+        elif choice in {"3", "5", "6", "7", "8"}:
             print("Not implemented yet.")
         else:
             print("Invalid choice.")

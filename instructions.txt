@@ -49,3 +49,7 @@ then do send_command.
 Also keep a error message thing in context that whenver error occurs it saves tot hat context field and then add a error function that would execute to print it and exit cleanly
 
 for host b do the same parse args, handle args, wait_for_session, estblish_session, listen_for_command, error
+
+step 4
+lets do the trasnfer a file to host b now. i wil add a transfer.txt file, i want u to now write the code that if option tranfer a file to hot b command is sent, host b sends an ack saying its ready for it. 
+then it packs the txt file depending on how big it is into however many packets it needs to bfit into the identifier field and numbers the pckets send it over and host b reeives them all and reproduces the file in its main directory

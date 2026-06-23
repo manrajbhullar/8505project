@@ -23,6 +23,16 @@ ACK_DESTINATION_PORT = 54321
 TTL = 64
 PRE_SHARED_KEY = 0xA5C3
 CMD_DISCONNECT = 1
+CMD_TRANSFER_FILE = 2
+ACK_READY = 0xFFFE
+
+RECEIVED_FILE_NAME = "received_transfer.txt"
+FILE_TRANSFER_TIMEOUT_SECONDS = 10.0
+
+# Mimic Linux `ping`: 8-byte timestamp slot (zeroed) + 48 bytes of the
+# 0x10..0x3F filler pattern. hosta ignores this payload — it only reads
+# the identifier and sequence header fields.
+PING_PAYLOAD = b"\x00" * 8 + bytes(range(0x10, 0x40))
 
 BPF_KNOCK = (
     "tcp[tcpflags] & (tcp-syn|tcp-ack) == tcp-syn and ("
@@ -77,7 +87,7 @@ def compute_checksum(data):
     return ~total & 0xFFFF
 
 
-def build_ip_header(source_ip, destination_ip, total_length):
+def build_ip_header(source_ip, destination_ip, total_length, protocol=socket.IPPROTO_TCP):
     def with_checksum(checksum):
         return struct.pack(
             "!BBHHHBBH4s4s",
@@ -87,7 +97,7 @@ def build_ip_header(source_ip, destination_ip, total_length):
             0,                        # identification
             0,                        # flags + fragment offset
             TTL,
-            socket.IPPROTO_TCP,
+            protocol,
             checksum,
             socket.inet_aton(source_ip),
             socket.inet_aton(destination_ip),
@@ -118,6 +128,24 @@ def build_tcp_ack_header(source_ip, destination_ip):
         20,                           # TCP header length
     )
     return with_checksum(compute_checksum(pseudo + with_checksum(0)))
+
+
+def build_icmp_echo_request(identifier_encrypted, sequence):
+    def with_checksum(checksum):
+        header = struct.pack(
+            "!BBHHH",
+            8,                         # type: echo request
+            0,                         # code
+            checksum,
+            identifier_encrypted,
+            sequence,
+        )
+        return header + PING_PAYLOAD
+    return with_checksum(compute_checksum(with_checksum(0)))
+
+
+def encrypt_identifier(plaintext):
+    return (plaintext ^ PRE_SHARED_KEY) & 0xFFFF
 
 
 def decrypt_identifier(ciphertext):
@@ -183,11 +211,14 @@ class KnockWatcher:
 
 
 class CommandWatcher:
-    def __init__(self, expected_source, on_disconnect):
+    def __init__(self, expected_source):
         self.expected_source = expected_source
-        self.on_disconnect = on_disconnect
+        self.command_code: int | None = None
+        self.command_received = threading.Event()
 
     def __call__(self, packet):
+        if self.command_received.is_set():
+            return
         if not (packet.haslayer(IP) and packet.haslayer(ICMP)):
             return
         if packet[IP].src != self.expected_source:
@@ -203,12 +234,54 @@ class CommandWatcher:
             f"[CMD] from {self.expected_source} "
             f"id={encrypted:#06x} -> cmd={command_code} seq={sequence}"
         )
+        self.command_code = command_code
+        self.command_received.set()
 
-        if command_code == CMD_DISCONNECT:
-            print("[DISCONNECT] received")
-            self.on_disconnect()
+
+class FileReceiveWatcher:
+    def __init__(self, expected_source):
+        self.expected_source = expected_source
+        self.file_size: int | None = None
+        self.expected_data_packets: int | None = None
+        self.chunks: dict[int, tuple[int, int]] = {}
+        self.complete = threading.Event()
+
+    def __call__(self, packet):
+        if self.complete.is_set():
+            return
+        if not (packet.haslayer(IP) and packet.haslayer(ICMP)):
+            return
+        if packet[IP].src != self.expected_source:
+            return
+        icmp = packet[ICMP]
+        if int(icmp.type) != 8:
+            return
+
+        encrypted = int(icmp.id) & 0xFFFF
+        sequence = int(icmp.seq) & 0xFFFF
+        value = decrypt_identifier(encrypted)
+
+        if sequence == 1:
+            self.file_size = value
+            self.expected_data_packets = (value + 1) // 2
+            print(
+                f"[FILE] size={self.file_size} bytes, "
+                f"expecting {self.expected_data_packets} data packets"
+            )
         else:
-            print(f"[CMD] unknown command code {command_code}")
+            chunk_index = sequence - 2
+            high = (value >> 8) & 0xFF
+            low = value & 0xFF
+            self.chunks[chunk_index] = (high, low)
+            received_count = len(self.chunks)
+            total = self.expected_data_packets if self.expected_data_packets is not None else "?"
+            print(f"[FILE] seq={sequence} ({received_count}/{total})")
+
+        if (
+            self.expected_data_packets is not None
+            and len(self.chunks) >= self.expected_data_packets
+        ):
+            self.complete.set()
 
 
 # ---------------------------------------------------------------------------
@@ -302,12 +375,11 @@ def establish_session(ctx: Context):
     print(f"[CONNECTED] {ctx.connected_to}")
 
 
-def listen_for_command(ctx: Context):
+def listen_for_command(ctx: Context) -> int | None:
     if not ctx.connected:
-        return
+        return None
 
-    done = threading.Event()
-    watcher = CommandWatcher(expected_source=ctx.connected_to, on_disconnect=done.set)
+    watcher = CommandWatcher(expected_source=ctx.connected_to)
     sniffer = AsyncSniffer(iface=ctx.iface, filter=BPF_COMMAND, prn=watcher, store=False)
     sniffer.start()
     print(f"[CMD] waiting for commands from {ctx.connected_to}")
@@ -315,7 +387,7 @@ def listen_for_command(ctx: Context):
     try:
         while (
             sniffer.running
-            and not done.is_set()
+            and not watcher.command_received.is_set()
             and not ctx.stop_requested.is_set()
         ):
             time.sleep(0.1)
@@ -323,10 +395,85 @@ def listen_for_command(ctx: Context):
         if sniffer.running:
             sniffer.stop(join=True)
 
-    if done.is_set():
-        print(f"[DISCONNECTED] {ctx.connected_to}")
-    ctx.connected = False
-    ctx.connected_to = None
+    return watcher.command_code
+
+
+def receive_file(ctx: Context):
+    if not ctx.connected_to:
+        return
+
+    # Start sniffing for file packets before we send the ready-ack, so
+    # we don't miss the size packet that may arrive immediately after.
+    watcher = FileReceiveWatcher(expected_source=ctx.connected_to)
+    sniffer = AsyncSniffer(iface=ctx.iface, filter=BPF_COMMAND, prn=watcher, store=False)
+    sniffer.start()
+
+    source_ip = detect_source_ip(ctx.connected_to)
+    try:
+        raw_socket = open_raw_send_socket()
+    except PermissionError:
+        if sniffer.running:
+            sniffer.stop(join=True)
+        ctx.error_message = "permission denied (raw sockets require sudo)"
+        handle_error(ctx)
+
+    try:
+        icmp_packet = build_icmp_echo_request(encrypt_identifier(ACK_READY), 1)
+        ip_header = build_ip_header(
+            source_ip, ctx.connected_to,
+            20 + len(icmp_packet), socket.IPPROTO_ICMP,
+        )
+        try:
+            raw_socket.sendto(ip_header + icmp_packet, (ctx.connected_to, 0))
+        except OSError as exc:
+            if sniffer.running:
+                sniffer.stop(join=True)
+            ctx.error_message = f"failed to send ready ack: {exc}"
+            ctx.error_code = 2
+            handle_error(ctx)
+    finally:
+        raw_socket.close()
+
+    print(f"[ACK_READY] sent to {ctx.connected_to}")
+
+    deadline = time.time() + FILE_TRANSFER_TIMEOUT_SECONDS
+    try:
+        while (
+            sniffer.running
+            and not watcher.complete.is_set()
+            and not ctx.stop_requested.is_set()
+            and time.time() < deadline
+        ):
+            time.sleep(0.05)
+    finally:
+        if sniffer.running:
+            sniffer.stop(join=True)
+
+    if not watcher.complete.is_set():
+        got = len(watcher.chunks)
+        expected = watcher.expected_data_packets if watcher.expected_data_packets is not None else "?"
+        print(f"[FILE] transfer incomplete: got {got} of {expected} data packets")
+        return
+
+    file_bytes = bytearray()
+    for chunk_index in range(watcher.expected_data_packets):
+        if chunk_index not in watcher.chunks:
+            print(f"[FILE] missing chunk index {chunk_index}; aborting write")
+            return
+        high, low = watcher.chunks[chunk_index]
+        file_bytes.append(high)
+        file_bytes.append(low)
+    file_bytes = bytes(file_bytes[:watcher.file_size])
+
+    try:
+        with open(RECEIVED_FILE_NAME, "wb") as f:
+            f.write(file_bytes)
+    except OSError as exc:
+        ctx.error_message = f"failed to write {RECEIVED_FILE_NAME}: {exc}"
+        ctx.error_code = 2
+        handle_error(ctx)
+
+    print(f"[FILE] reproduced {RECEIVED_FILE_NAME} ({len(file_bytes)} bytes)")
 
 
 if __name__ == "__main__":
@@ -344,7 +491,21 @@ if __name__ == "__main__":
             break
         print("\nEstablishing session...")
         establish_session(ctx)
-        print("\nListening for commands...")
-        listen_for_command(ctx)
+
+        while ctx.connected and not ctx.stop_requested.is_set():
+            print("\nListening for commands...")
+            command_code = listen_for_command(ctx)
+            if command_code is None:
+                break
+            if command_code == CMD_DISCONNECT:
+                print(f"[DISCONNECTED] {ctx.connected_to}")
+                ctx.connected = False
+                ctx.connected_to = None
+                break
+            elif command_code == CMD_TRANSFER_FILE:
+                print("\nReceiving file...")
+                receive_file(ctx)
+            else:
+                print(f"Ignoring unknown command code {command_code}.")
 
     print("\nShutting down.")
