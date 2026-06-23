@@ -1,13 +1,7 @@
 """hosta: control center for the remote administration tool.
 
-FSM:
-    parse_arguments -> handle_arguments -> display_menu (loop)
-        option 1 -> establish_session
-        option 2 -> send_command(CMD_DISCONNECT)
-    on any failure -> handle_error -> exit
-
 Usage:
-    sudo python3 hosta.py -a <hostb_ip>
+    sudo python3 hosta.py -t <hostb_ip>
 """
 
 import argparse
@@ -168,7 +162,7 @@ def parse_arguments(ctx: Context, argv: list[str] | None = None):
         prog="hosta",
         description="Control center for the remote administration tool.",
     )
-    parser.add_argument("-a", dest="hostb_ip", required=True,
+    parser.add_argument("-t", dest="hostb_ip", required=True,
                         metavar="<hostb_ip>",
                         help="IP address of hostb")
 
