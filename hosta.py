@@ -34,9 +34,8 @@ ACK_CHUNK = 0xFFFC
 ACK_END = 0xFFFB
 
 # Run-program limits.
-MAX_COMMAND_BYTES = 0xFFFF
-OUTPUT_TIMEOUT_SECONDS = 60.0
-FILE_PACKET_DELAY_SECONDS = 0.002
+MAX_COMMAND_BYTES = 0xFFFFFFFF               # command bytes use 32-bit size header
+OUTPUT_TIMEOUT_SECONDS = 60.0                # wait this long for output metadata
 
 # File transfer: chunked stop-and-wait protocol.
 # Each chunk = CHUNK_PACKETS data packets carrying 2 bytes each.
@@ -62,6 +61,10 @@ META_FILENAME_LENGTH_SEQ = 1
 META_FILE_SIZE_HI_SEQ = 2
 META_FILE_SIZE_LO_SEQ = 3
 META_FILENAME_FIRST_SEQ = 4
+
+# Byte-stream metadata (run-program command and output): just the 32-bit size.
+STREAM_SIZE_HI_SEQ = 1
+STREAM_SIZE_LO_SEQ = 2
 
 # Mimic Linux `ping`: 8-byte timestamp slot (zeroed) + 48 bytes of the
 # 0x10..0x3F filler pattern. hostb ignores this payload — it only reads
@@ -306,54 +309,201 @@ def send_chunk(send_socket, source_ip, destination_ip, key, chunk_index, chunk_b
             time.sleep(CHUNK_PACKET_DELAY_SECONDS)
 
 
-def receive_byte_stream(recv_socket, source_ip, key, timeout):
-    """Receive a one-header byte stream (seq=1 size, seq=2..N+1 data) and reassemble."""
+def _read_icmp_echo(recv_socket, source_ip, remaining):
+    """Block up to `remaining` seconds for one ICMP echo request from source_ip.
+    Returns (sequence, identifier) on a matching packet, None on timeout, or ()
+    on a packet that didn't match (caller should keep looping)."""
+    if remaining <= 0:
+        return None
+    recv_socket.settimeout(remaining)
+    try:
+        packet, _ = recv_socket.recvfrom(65535)
+    except socket.timeout:
+        return None
+    if len(packet) < 28:
+        return ()
+    ip_header_length = (packet[0] & 0x0F) * 4
+    if len(packet) < ip_header_length + 8:
+        return ()
+    if socket.inet_ntoa(packet[12:16]) != source_ip:
+        return ()
+    icmp_header = packet[ip_header_length:ip_header_length + 8]
+    icmp_type, _code, _chk, identifier, sequence = struct.unpack("!BBHHH", icmp_header)
+    if icmp_type != 8:
+        return ()
+    return sequence, identifier
+
+
+def send_ack(send_socket, source_ip, destination_ip, key, identifier_sentinel, sequence=1):
+    icmp = build_icmp_echo_request(encrypt_identifier(identifier_sentinel, key), sequence)
+    ip = build_ip_header(source_ip, destination_ip, 20 + len(icmp), socket.IPPROTO_ICMP)
+    send_socket.sendto(ip + icmp, (destination_ip, 0))
+
+
+def receive_chunk(recv_socket, send_socket, source_ip, my_ip, key,
+                  expected_chunk_index, expected_packets, chunks_written, timeout):
+    """Collect one chunk's data packets. Returns (bytes, None) on success or
+    (None, missing_count) on timeout. Mirrors hostb.receive_chunk."""
     packets: dict[int, int] = {}
-    byte_count: int | None = None
+    saw_header = False
     deadline = time.time() + timeout
 
     while True:
         remaining = deadline - time.time()
-        if remaining <= 0:
-            break
-        recv_socket.settimeout(remaining)
-        try:
-            packet, _ = recv_socket.recvfrom(65535)
-        except socket.timeout:
-            break
-        if len(packet) < 28:
+        result = _read_icmp_echo(recv_socket, source_ip, remaining)
+        if result is None:
+            return None, expected_packets - len(packets)
+        if result == ():
             continue
-        ip_header_length = (packet[0] & 0x0F) * 4
-        if len(packet) < ip_header_length + 8:
-            continue
-        if socket.inet_ntoa(packet[12:16]) != source_ip:
-            continue
-        icmp_header = packet[ip_header_length:ip_header_length + 8]
-        icmp_type, _code, _chk, identifier, sequence = struct.unpack("!BBHHH", icmp_header)
-        if icmp_type != 8:
-            continue
-
+        sequence, identifier = result
         value = decrypt_identifier(identifier, key)
-        packets[sequence] = value
-        if sequence == 1:
-            byte_count = value
-        if byte_count is not None:
-            expected = 1 + (byte_count + 1) // 2
-            if len(packets) >= expected:
-                break
 
+        if sequence == CHUNK_HEADER_SEQ:
+            chunk_index = value
+            if chunk_index in chunks_written:
+                send_ack(send_socket, my_ip, source_ip, key, ACK_CHUNK, sequence=chunk_index)
+                continue
+            if chunk_index != expected_chunk_index:
+                continue
+            packets = {}
+            saw_header = True
+            deadline = time.time() + timeout
+            continue
+
+        if not saw_header:
+            continue
+        if 1 <= sequence <= expected_packets:
+            packets[sequence] = value
+            if len(packets) >= expected_packets:
+                out = bytearray()
+                for i in range(1, expected_packets + 1):
+                    v = packets.get(i)
+                    if v is None:
+                        return None, expected_packets - len(packets)
+                    out.append((v >> 8) & 0xFF)
+                    out.append(v & 0xFF)
+                return bytes(out), None
+
+
+def drain_for_end(recv_socket, send_socket, source_ip, my_ip, key, chunks_written, timeout):
+    """Brief listen window after the last chunk: ACK the END marker if it
+    arrives, and re-ACK any in-flight duplicate chunk headers."""
+    deadline = time.time() + timeout
+    while True:
+        remaining = deadline - time.time()
+        result = _read_icmp_echo(recv_socket, source_ip, remaining)
+        if result is None:
+            return
+        if result == ():
+            continue
+        sequence, identifier = result
+        value = decrypt_identifier(identifier, key)
+        if sequence == END_SEQ:
+            send_ack(send_socket, my_ip, source_ip, key, ACK_END)
+            return
+        if sequence == CHUNK_HEADER_SEQ and value in chunks_written:
+            send_ack(send_socket, my_ip, source_ip, key, ACK_CHUNK, sequence=value)
+
+
+def receive_byte_metadata(recv_socket, source_ip, key, timeout):
+    """Receive the 2-packet byte-stream metadata (seq=1 size_hi, seq=2 size_lo).
+    Returns the 32-bit byte count or None on timeout."""
+    packets: dict[int, int] = {}
+    deadline = time.time() + timeout
+    while True:
+        remaining = deadline - time.time()
+        result = _read_icmp_echo(recv_socket, source_ip, remaining)
+        if result is None:
+            return None
+        if result == ():
+            continue
+        sequence, identifier = result
+        if sequence in (STREAM_SIZE_HI_SEQ, STREAM_SIZE_LO_SEQ):
+            packets[sequence] = decrypt_identifier(identifier, key)
+            if STREAM_SIZE_HI_SEQ in packets and STREAM_SIZE_LO_SEQ in packets:
+                return (packets[STREAM_SIZE_HI_SEQ] << 16) | packets[STREAM_SIZE_LO_SEQ]
+
+
+def send_byte_stream_chunked(send_socket, recv_socket, my_ip, peer_ip, key, payload):
+    """Send `payload` to peer using the chunk+ACK protocol.
+    Sequence: metadata (size_hi, size_lo) -> wait ACK_META -> per-chunk
+    send+wait ACK_CHUNK with retries -> fire-and-forget END -> wait ACK_END.
+    Returns True on success, False otherwise (no exception raised)."""
+    byte_count = len(payload)
+    byte_count_hi = (byte_count >> 16) & 0xFFFF
+    byte_count_lo = byte_count & 0xFFFF
+    try:
+        send_icmp_identifier(send_socket, my_ip, peer_ip,
+                             encrypt_identifier(byte_count_hi, key), STREAM_SIZE_HI_SEQ)
+        send_icmp_identifier(send_socket, my_ip, peer_ip,
+                             encrypt_identifier(byte_count_lo, key), STREAM_SIZE_LO_SEQ)
+    except OSError:
+        return False
+    if not wait_for_ack(recv_socket, peer_ip, key, ACK_META, None, META_ACK_TIMEOUT_SECONDS):
+        return False
+
+    total_chunks = 0 if byte_count == 0 else (byte_count + CHUNK_BYTES - 1) // CHUNK_BYTES
+    for chunk_index in range(total_chunks):
+        chunk_start = chunk_index * CHUNK_BYTES
+        chunk_data = payload[chunk_start:chunk_start + CHUNK_BYTES]
+        acked = False
+        for attempt in range(1, MAX_CHUNK_RETRIES + 1):
+            try:
+                send_chunk(send_socket, my_ip, peer_ip, key, chunk_index, chunk_data)
+            except OSError:
+                return False
+            if wait_for_ack(recv_socket, peer_ip, key, ACK_CHUNK, chunk_index,
+                            CHUNK_ACK_TIMEOUT_SECONDS):
+                acked = True
+                break
+            print(f"  chunk {chunk_index} ack timed out (attempt {attempt}/{MAX_CHUNK_RETRIES})")
+        if not acked:
+            return False
+
+    try:
+        send_icmp_identifier(send_socket, my_ip, peer_ip,
+                             encrypt_identifier(0, key), END_SEQ)
+    except OSError:
+        pass
+    wait_for_ack(recv_socket, peer_ip, key, ACK_END, None, END_ACK_TIMEOUT_SECONDS)
+    return True
+
+
+def receive_byte_stream_chunked(recv_socket, send_socket, my_ip, peer_ip, key, metadata_timeout):
+    """Receive a chunked byte stream. Sender must already be past any preceding
+    handshake. Returns the assembled bytes or None on failure."""
+    byte_count = receive_byte_metadata(recv_socket, peer_ip, key, metadata_timeout)
     if byte_count is None:
         return None
-    num_chunks = (byte_count + 1) // 2
-    out = bytearray()
-    for i in range(num_chunks):
-        seq = 2 + i
-        if seq not in packets:
+    try:
+        send_ack(send_socket, my_ip, peer_ip, key, ACK_META)
+    except OSError:
+        return None
+
+    output = bytearray()
+    total_chunks = 0 if byte_count == 0 else (byte_count + CHUNK_BYTES - 1) // CHUNK_BYTES
+    chunks_written: set[int] = set()
+    for chunk_index in range(total_chunks):
+        chunk_byte_count = min(CHUNK_BYTES, byte_count - chunk_index * CHUNK_BYTES)
+        expected_packets = (chunk_byte_count + 1) // 2
+        chunk_bytes, missing = receive_chunk(
+            recv_socket, send_socket, peer_ip, my_ip, key,
+            chunk_index, expected_packets, chunks_written, CHUNK_RECV_TIMEOUT_SECONDS,
+        )
+        if chunk_bytes is None:
+            print(f"  output chunk {chunk_index} receive failed "
+                  f"(missing {missing}/{expected_packets} packets)")
             return None
-        v = packets[seq]
-        out.append((v >> 8) & 0xFF)
-        out.append(v & 0xFF)
-    return bytes(out[:byte_count])
+        output.extend(chunk_bytes[:chunk_byte_count])
+        chunks_written.add(chunk_index)
+        try:
+            send_ack(send_socket, my_ip, peer_ip, key, ACK_CHUNK, sequence=chunk_index)
+        except OSError:
+            return None
+
+    drain_for_end(recv_socket, send_socket, peer_ip, my_ip, key,
+                  chunks_written, END_DRAIN_TIMEOUT_SECONDS)
+    return bytes(output)
 
 
 # ---------------------------------------------------------------------------
@@ -683,17 +833,17 @@ def run_program(ctx: Context):
         print(f"Run failed: command too long ({command_length} bytes, max {MAX_COMMAND_BYTES}).")
         return
 
-    num_command_packets = (command_length + 1) // 2
-    print(f"Command: {command_text!r} ({command_length} bytes, {num_command_packets} packets)")
+    print(f"Command: {command_text!r} ({command_length} bytes)")
 
     try:
-        recv_socket = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_ICMP)
+        recv_socket = open_raw_icmp_recv_socket()
         send_socket = open_raw_send_socket()
     except PermissionError:
         ctx.error_message = "permission denied (raw sockets require sudo)"
         handle_error(ctx)
 
     try:
+        # Phase A: run request -> wait for ACK_READY.
         try:
             send_icmp_identifier(
                 send_socket, ctx.source_ip, ctx.destination_ip,
@@ -705,39 +855,22 @@ def run_program(ctx: Context):
             handle_error(ctx)
         print(f"Sent run request (cmd={CMD_RUN_PROGRAM}). Waiting for ready ack...")
 
-        if not wait_for_ack_ready(recv_socket, ctx.destination_ip, ctx.key, READY_TIMEOUT_SECONDS):
+        if not wait_for_ack_ready(recv_socket, ctx.destination_ip, ctx.key,
+                                  READY_TIMEOUT_SECONDS):
             print("Run failed: no ready ack from hostb.")
             return
         print("hostb is ready. Sending command...")
 
-        try:
-            send_icmp_identifier(
-                send_socket, ctx.source_ip, ctx.destination_ip,
-                encrypt_identifier(command_length, ctx.key), 1,
-            )
-            if FILE_PACKET_DELAY_SECONDS > 0:
-                time.sleep(FILE_PACKET_DELAY_SECONDS)
-            for chunk_index in range(num_command_packets):
-                sequence = 2 + chunk_index
-                byte_offset = chunk_index * 2
-                high = command_bytes[byte_offset]
-                low = command_bytes[byte_offset + 1] if byte_offset + 1 < command_length else 0
-                chunk_value = (high << 8) | low
-                send_icmp_identifier(
-                    send_socket, ctx.source_ip, ctx.destination_ip,
-                    encrypt_identifier(chunk_value, ctx.key), sequence,
-                )
-                if FILE_PACKET_DELAY_SECONDS > 0:
-                    time.sleep(FILE_PACKET_DELAY_SECONDS)
-        except OSError as exc:
-            ctx.error_message = f"failed to send command bytes: {exc}"
-            ctx.error_code = 2
-            handle_error(ctx)
+        if not send_byte_stream_chunked(send_socket, recv_socket,
+                                        ctx.source_ip, ctx.destination_ip,
+                                        ctx.key, command_bytes):
+            print("Run failed: command send aborted.")
+            return
+        print("Command sent. Waiting for output...")
 
-        print(f"Sent {1 + num_command_packets} packets. Waiting for output...")
-
-        output_bytes = receive_byte_stream(
-            recv_socket, ctx.destination_ip, ctx.key, OUTPUT_TIMEOUT_SECONDS
+        output_bytes = receive_byte_stream_chunked(
+            recv_socket, send_socket, ctx.source_ip, ctx.destination_ip,
+            ctx.key, OUTPUT_TIMEOUT_SECONDS,
         )
         if output_bytes is None:
             print("Run failed: timed out or incomplete output from hostb.")
