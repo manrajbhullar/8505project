@@ -29,7 +29,7 @@ CMD_TRANSFER_FILE = 2
 ACK_READY = 0xFFFE
 
 # File transfer settings (block-based protocol with per-block ack).
-BLOCK_BYTES = 60000                          # bytes per block; well under the 16-bit seq cap
+BLOCK_BYTES = 10000                          # bytes per block; keeps each burst under the raw-socket buffer
 MAX_FILENAME_BYTES = 0xFF                    # sanity cap for filename length
 READY_TIMEOUT_SECONDS = 5.0
 BLOCK_ACK_TIMEOUT_SECONDS = 60.0
