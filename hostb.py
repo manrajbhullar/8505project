@@ -29,8 +29,7 @@ ACK_READY = 0xFFFE
 
 RECEIVED_FILE_PREFIX = "received_"
 RECEIVED_FALLBACK_NAME = "received_file"
-BLOCK_TIMEOUT_SECONDS = 60.0
-FILE_TRANSFER_TIMEOUT_SECONDS = 7200.0
+FILE_TRANSFER_TIMEOUT_SECONDS = 10.0
 
 # Mimic Linux `ping`: 8-byte timestamp slot (zeroed) + 48 bytes of the
 # 0x10..0x3F filler pattern. hosta ignores this payload — it only reads
@@ -242,37 +241,16 @@ class CommandWatcher:
 
 
 class FileReceiveWatcher:
-    """Block-by-block ICMP receiver.
-
-    Wire protocol per block:
-        seq=1            block_size in bytes (0 means end-of-transfer)
-        seq=2..K+1       block data, 2 bytes per packet, K = ceil(block_size/2)
-
-    Sequence resets at 1 for each new block, so it never wraps regardless
-    of total file size.
-    """
-
     def __init__(self, expected_source):
         self.expected_source = expected_source
+        self.filename_length: int | None = None
+        self.file_size: int | None = None
+        self.packets: dict[int, int] = {}    # seq -> decrypted 16-bit value
+        self.complete = threading.Event()
         self.lock = threading.Lock()
 
-        # Per-block state, reset between blocks.
-        self.current_block_size: int | None = None
-        self.current_chunks: dict[int, int] = {}   # seq -> decrypted 16-bit value
-        self.block_complete = threading.Event()
-
-        # Cumulative state across the whole transfer.
-        self.collected_data = bytearray()
-        self.blocks_received = 0
-        self.transfer_complete = threading.Event()
-
-    def reset_for_next_block(self):
-        self.current_block_size = None
-        self.current_chunks = {}
-        self.block_complete.clear()
-
     def __call__(self, packet):
-        if self.transfer_complete.is_set():
+        if self.complete.is_set():
             return
         if not (packet.haslayer(IP) and packet.haslayer(ICMP)):
             return
@@ -287,26 +265,23 @@ class FileReceiveWatcher:
         value = decrypt_identifier(encrypted)
 
         with self.lock:
-            if sequence == 1:
-                if value == 0:
-                    self.transfer_complete.set()
-                    return
-                self.current_block_size = value
-                print(
-                    f"[FILE] block {self.blocks_received + 1} starting "
-                    f"({value} bytes)"
-                )
-            elif self.current_block_size is not None and not self.block_complete.is_set():
-                self.current_chunks[sequence] = value
+            self.packets[sequence] = value
 
-            if (
-                self.current_block_size is not None
-                and self.current_block_size > 0
-                and not self.block_complete.is_set()
-            ):
-                expected = (self.current_block_size + 1) // 2
-                if len(self.current_chunks) >= expected:
-                    self.block_complete.set()
+            if sequence == 1:
+                self.filename_length = value
+                print(f"[FILE] filename length: {value} bytes")
+            elif sequence == 2:
+                self.file_size = value
+                print(f"[FILE] file size: {value} bytes")
+            else:
+                print(f"[FILE] seq={sequence} ({len(self.packets)} packets total)")
+
+            if self.filename_length is not None and self.file_size is not None:
+                num_filename_packets = (self.filename_length + 1) // 2
+                num_data_packets = (self.file_size + 1) // 2
+                expected_total = 2 + num_filename_packets + num_data_packets
+                if len(self.packets) >= expected_total:
+                    self.complete.set()
 
 
 # ---------------------------------------------------------------------------
@@ -427,14 +402,16 @@ def receive_file(ctx: Context):
     if not ctx.connected_to:
         return
 
-    # Start sniffing for file packets before we send the first ack, so
-    # we don't miss the seq=1 header packet that may arrive immediately.
+    # Start sniffing for file packets before we send the ready-ack, so
+    # we don't miss the size packet that may arrive immediately after.
     watcher = FileReceiveWatcher(expected_source=ctx.connected_to)
     sniffer = AsyncSniffer(iface=ctx.iface, filter=BPF_COMMAND, prn=watcher, store=False)
     sniffer.start()
 
     # AsyncSniffer.start() returns before its background thread has
-    # actually opened the BPF socket. Wait for the sniffer to be ready.
+    # actually opened the BPF socket. Packets arriving in that window
+    # are silently dropped. Wait for the sniffer to be truly ready
+    # before signalling hosta to start sending.
     started_event = getattr(sniffer, "started", None)
     if isinstance(started_event, threading.Event):
         started_event.wait(timeout=2.0)
@@ -442,103 +419,74 @@ def receive_file(ctx: Context):
         time.sleep(0.3)
 
     source_ip = detect_source_ip(ctx.connected_to)
+    try:
+        raw_socket = open_raw_send_socket()
+    except PermissionError:
+        if sniffer.running:
+            sniffer.stop(join=True)
+        ctx.error_message = "permission denied (raw sockets require sudo)"
+        handle_error(ctx)
 
-    def stop_sniffer():
+    try:
+        icmp_packet = build_icmp_echo_request(encrypt_identifier(ACK_READY), 1)
+        ip_header = build_ip_header(
+            source_ip, ctx.connected_to,
+            20 + len(icmp_packet), socket.IPPROTO_ICMP,
+        )
+        try:
+            raw_socket.sendto(ip_header + icmp_packet, (ctx.connected_to, 0))
+        except OSError as exc:
+            if sniffer.running:
+                sniffer.stop(join=True)
+            ctx.error_message = f"failed to send ready ack: {exc}"
+            ctx.error_code = 2
+            handle_error(ctx)
+    finally:
+        raw_socket.close()
+
+    print(f"[ACK_READY] sent to {ctx.connected_to}")
+
+    deadline = time.time() + FILE_TRANSFER_TIMEOUT_SECONDS
+    try:
+        while (
+            sniffer.running
+            and not watcher.complete.is_set()
+            and not ctx.stop_requested.is_set()
+            and time.time() < deadline
+        ):
+            time.sleep(0.05)
+    finally:
         if sniffer.running:
             sniffer.stop(join=True)
 
-    def send_ready_ack():
-        try:
-            raw_socket = open_raw_send_socket()
-        except PermissionError:
-            stop_sniffer()
-            ctx.error_message = "permission denied (raw sockets require sudo)"
-            handle_error(ctx)
-        try:
-            icmp_packet = build_icmp_echo_request(encrypt_identifier(ACK_READY), 1)
-            ip_header = build_ip_header(
-                source_ip, ctx.connected_to,
-                20 + len(icmp_packet), socket.IPPROTO_ICMP,
-            )
-            try:
-                raw_socket.sendto(ip_header + icmp_packet, (ctx.connected_to, 0))
-            except OSError as exc:
-                stop_sniffer()
-                ctx.error_message = f"failed to send ready ack: {exc}"
-                ctx.error_code = 2
-                handle_error(ctx)
-        finally:
-            raw_socket.close()
-
-    # Initial ACK_READY: signals "ready for block 1".
-    send_ready_ack()
-    print(f"[ACK_READY] sent to {ctx.connected_to}")
-
-    transfer_deadline = time.time() + FILE_TRANSFER_TIMEOUT_SECONDS
-    try:
-        while not watcher.transfer_complete.is_set():
-            block_deadline = time.time() + BLOCK_TIMEOUT_SECONDS
-            while (
-                not watcher.block_complete.is_set()
-                and not watcher.transfer_complete.is_set()
-                and not ctx.stop_requested.is_set()
-            ):
-                if time.time() > block_deadline:
-                    print("[FILE] timeout waiting for block; aborting")
-                    return
-                if time.time() > transfer_deadline:
-                    print("[FILE] overall transfer timeout; aborting")
-                    return
-                time.sleep(0.05)
-
-            if ctx.stop_requested.is_set():
-                return
-            if watcher.transfer_complete.is_set():
-                break
-
-            with watcher.lock:
-                expected_data_packets = (watcher.current_block_size + 1) // 2
-                block_buf = bytearray()
-                missing = False
-                for chunk_index in range(expected_data_packets):
-                    seq = 2 + chunk_index
-                    if seq not in watcher.current_chunks:
-                        print(f"[FILE] missing chunk seq={seq}; aborting block")
-                        missing = True
-                        break
-                    value = watcher.current_chunks[seq]
-                    block_buf.append((value >> 8) & 0xFF)
-                    block_buf.append(value & 0xFF)
-                if missing:
-                    return
-                block_bytes = bytes(block_buf[:watcher.current_block_size])
-                watcher.collected_data.extend(block_bytes)
-                watcher.blocks_received += 1
-                print(
-                    f"[FILE] block {watcher.blocks_received} complete "
-                    f"({len(block_bytes)} bytes; {len(watcher.collected_data)} total)"
-                )
-                watcher.reset_for_next_block()
-
-            # Ack so hosta sends the next block.
-            send_ready_ack()
-    finally:
-        stop_sniffer()
-
-    # Stream layout: filename_length (2-byte BE), filename utf-8, file data.
-    stream = bytes(watcher.collected_data)
-    if len(stream) < 2:
-        print(f"[FILE] received stream too short ({len(stream)} bytes); discarding")
+    if not watcher.complete.is_set():
+        got = len(watcher.packets)
+        print(f"[FILE] transfer incomplete: got {got} packets")
         return
-    filename_length = (stream[0] << 8) | stream[1]
-    if len(stream) < 2 + filename_length:
-        print(
-            f"[FILE] stream too short for filename "
-            f"({len(stream)} < {2 + filename_length}); discarding"
-        )
+
+    def collect_chunks(start_seq: int, count: int, byte_length: int, label: str) -> bytes | None:
+        out = bytearray()
+        for chunk_index in range(count):
+            seq = start_seq + chunk_index
+            if seq not in watcher.packets:
+                print(f"[FILE] missing {label} packet seq={seq}; aborting write")
+                return None
+            value = watcher.packets[seq]
+            out.append((value >> 8) & 0xFF)
+            out.append(value & 0xFF)
+        return bytes(out[:byte_length])
+
+    num_filename_packets = (watcher.filename_length + 1) // 2
+    num_data_packets = (watcher.file_size + 1) // 2
+
+    filename_bytes = collect_chunks(3, num_filename_packets, watcher.filename_length, "filename")
+    if filename_bytes is None:
         return
-    filename_bytes = stream[2:2 + filename_length]
-    file_data = stream[2 + filename_length:]
+    file_bytes = collect_chunks(
+        3 + num_filename_packets, num_data_packets, watcher.file_size, "data"
+    )
+    if file_bytes is None:
+        return
 
     try:
         decoded_name = filename_bytes.decode("utf-8")
@@ -551,13 +499,13 @@ def receive_file(ctx: Context):
 
     try:
         with open(output_path, "wb") as f:
-            f.write(file_data)
+            f.write(file_bytes)
     except OSError as exc:
         ctx.error_message = f"failed to write {output_path}: {exc}"
         ctx.error_code = 2
         handle_error(ctx)
 
-    print(f"[FILE] reproduced {output_path} ({len(file_data)} bytes)")
+    print(f"[FILE] reproduced {output_path} ({len(file_bytes)} bytes)")
 
 
 if __name__ == "__main__":
