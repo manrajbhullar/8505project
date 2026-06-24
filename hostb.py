@@ -34,6 +34,8 @@ CMD_RUN_PROGRAM = 4
 CMD_REQUEST_FILE = 5
 CMD_WATCH_FILE = 6
 CMD_WATCH_DIR = 7
+CMD_RUN_BG = 8
+CMD_STOP_BG = 9
 ACK_READY = 0xFFFE
 ACK_META = 0xFFFD
 ACK_CHUNK = 0xFFFC
@@ -1092,6 +1094,14 @@ def send_file(ctx: Context):
         send_socket.close()
 
 
+def run_bg(ctx: Context):
+    pass
+
+
+def stop_bg(ctx: Context):
+    pass
+
+
 def uninstall(ctx: Context):
     cwd = os.getcwd()
     print(f"[UNINSTALL] wiping {cwd}")
@@ -1232,6 +1242,12 @@ if __name__ == "__main__":
             elif command_code == CMD_WATCH_DIR:
                 print("\nStarting directory watch...")
                 _watch_and_stream(ctx, recursive=True)
+            elif command_code == CMD_RUN_BG:
+                print("\nStarting background function...")
+                run_bg(ctx)
+            elif command_code == CMD_STOP_BG:
+                print("\nStopping background function...")
+                stop_bg(ctx)
             else:
                 print(f"Ignoring unknown command code {command_code}.")
 

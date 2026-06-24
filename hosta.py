@@ -33,6 +33,8 @@ CMD_RUN_PROGRAM = 4
 CMD_REQUEST_FILE = 5
 CMD_WATCH_FILE = 6
 CMD_WATCH_DIR = 7
+CMD_RUN_BG = 8
+CMD_STOP_BG = 9
 ACK_READY = 0xFFFE
 ACK_META = 0xFFFD
 ACK_CHUNK = 0xFFFC
@@ -89,6 +91,8 @@ MENU_OPTIONS = (
     "Connect to hostb",
     "Disconnect from hostb",
     "Uninstall from hostb",
+    "Start background function",
+    "Stop background function",
     "Transfer file to hostb",
     "Transfer file from hostb",
     "Watch file on hostb",
@@ -1146,18 +1150,24 @@ if __name__ == "__main__":
             print("\nSending uninstall command...")
             send_command(ctx, CMD_UNINSTALL)
         elif choice == "4":
+            print("\nSending run background command...")
+            send_command(ctx, CMD_RUN_BG)
+        elif choice == "5":
+            print("\nSending stop background command...")
+            send_command(ctx, CMD_STOP_BG)
+        elif choice == "6":
             print("\nTransferring file to hostb...")
             transfer_file(ctx)
-        elif choice == "5":
+        elif choice == "7":
             print("\nRequesting file from hostb...")
             request_file(ctx)
-        elif choice == "6":
+        elif choice == "8":
             print("\nWatching file on hostb...")
             watch_item(ctx, CMD_WATCH_FILE)
-        elif choice == "7":
+        elif choice == "9":
             print("\nWatching directory on hostb...")
             watch_item(ctx, CMD_WATCH_DIR)
-        elif choice == "8":
+        elif choice == "10":
             print("\nRunning program on hostb...")
             run_program(ctx)
         else:
