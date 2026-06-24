@@ -539,17 +539,41 @@ def _watch_and_stream(ctx: Context, recursive: bool):
         print("[WATCH] inotify_simple not installed. Run: pip install inotify_simple")
         return
 
-    PRIORITY_EVENTS = [
-        (iflags.MOVED_TO,    "MOVED_TO"),
-        (iflags.MOVED_FROM,  "MOVED_FROM"),
-        (iflags.CLOSE_WRITE, "CLOSE_WRITE"),
-        (iflags.CREATE,      "CREATE"),
-        (iflags.DELETE,      "DELETE"),
-        (iflags.ATTRIB,      "ATTRIB"),
-        (iflags.MODIFY,      "MODIFY"),
-    ]
-    watch_flags = (iflags.MOVED_TO | iflags.MOVED_FROM | iflags.CLOSE_WRITE |
-                   iflags.CREATE | iflags.DELETE | iflags.ATTRIB | iflags.MODIFY)
+    if recursive:
+        # Directory watch: events for entries inside the directory.
+        PRIORITY_EVENTS = [
+            (iflags.MOVED_TO,    "MOVED_TO"),
+            (iflags.MOVED_FROM,  "MOVED_FROM"),
+            (iflags.MOVE_SELF,   "MOVE_SELF"),
+            (iflags.DELETE_SELF, "DELETE_SELF"),
+            (iflags.CLOSE_WRITE, "CLOSE_WRITE"),
+            (iflags.CREATE,      "CREATE"),
+            (iflags.DELETE,      "DELETE"),
+            (iflags.ATTRIB,      "ATTRIB"),
+            (iflags.MODIFY,      "MODIFY"),
+            (iflags.OPEN,        "OPEN"),
+            (iflags.Q_OVERFLOW,  "Q_OVERFLOW"),
+        ]
+        watch_flags = (iflags.MOVED_TO | iflags.MOVED_FROM | iflags.MOVE_SELF |
+                       iflags.DELETE_SELF | iflags.CLOSE_WRITE |
+                       iflags.CREATE | iflags.DELETE | iflags.ATTRIB | iflags.MODIFY |
+                       iflags.OPEN)
+    else:
+        # File watch: events for that specific file only.
+        PRIORITY_EVENTS = [
+            (iflags.MOVE_SELF,     "MOVE_SELF"),
+            (iflags.DELETE_SELF,   "DELETE_SELF"),
+            (iflags.CLOSE_WRITE,   "CLOSE_WRITE"),
+            (iflags.CLOSE_NOWRITE, "CLOSE_NOWRITE"),
+            (iflags.ATTRIB,        "ATTRIB"),
+            (iflags.MODIFY,        "MODIFY"),
+            (iflags.OPEN,          "OPEN"),
+            (iflags.ACCESS,        "ACCESS"),
+            (iflags.Q_OVERFLOW,    "Q_OVERFLOW"),
+        ]
+        watch_flags = (iflags.MOVE_SELF | iflags.DELETE_SELF |
+                       iflags.CLOSE_WRITE | iflags.CLOSE_NOWRITE |
+                       iflags.ATTRIB | iflags.MODIFY | iflags.OPEN | iflags.ACCESS)
 
     source_ip = detect_source_ip(ctx.connected_to)
     try:
