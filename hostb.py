@@ -596,41 +596,58 @@ def _watch_and_stream(ctx: Context, recursive: bool):
 
         print(f"[WATCH] watching — send stop from hosta or wait {WATCH_TIMEOUT_SECONDS}s")
         deadline = time.time() + WATCH_TIMEOUT_SECONDS
+        inotify_fd = inotify.fileno()
 
-        while time.time() < deadline:
-            # Non-blocking check for WATCH_STOP from hosta.
-            readable, _, _ = select.select([recv_socket], [], [], 0)
-            if readable:
-                try:
-                    packet, _ = recv_socket.recvfrom(65535)
-                    if len(packet) >= 28:
-                        ihl = (packet[0] & 0x0F) * 4
-                        if len(packet) >= ihl + 8:
-                            icmp_hdr = packet[ihl:ihl + 8]
-                            icmp_type, _, _, identifier, _ = struct.unpack("!BBHHH", icmp_hdr)
-                            if icmp_type == 8:
-                                if decrypt_identifier(identifier, ctx.key) == WATCH_STOP:
+        while time.time() < deadline and not ctx.stop_requested.is_set():
+            # Wait on BOTH the raw socket (WATCH_STOP) and the inotify fd (fs events)
+            # so either one wakes the loop immediately instead of polling.
+            remaining = min(1.0, deadline - time.time())
+            try:
+                readable, _, _ = select.select([recv_socket, inotify_fd], [], [], remaining)
+            except OSError:
+                break
+
+            if recv_socket in readable:
+                # Drain all queued packets so WATCH_STOP isn't buried behind others.
+                stop_received = False
+                while True:
+                    r, _, _ = select.select([recv_socket], [], [], 0)
+                    if not r:
+                        break
+                    try:
+                        packet, _ = recv_socket.recvfrom(65535)
+                        if len(packet) >= 28:
+                            ihl = (packet[0] & 0x0F) * 4
+                            if len(packet) >= ihl + 8:
+                                icmp_hdr = packet[ihl:ihl + 8]
+                                icmp_type, _, _, identifier, _ = struct.unpack(
+                                    "!BBHHH", icmp_hdr)
+                                if (icmp_type == 8 and
+                                        decrypt_identifier(identifier, ctx.key) == WATCH_STOP):
                                     print("[WATCH] stop signal received")
-                                    break
-                except OSError:
-                    pass
+                                    stop_received = True
+                    except OSError:
+                        break
+                if stop_received:
+                    break
 
-            events = inotify.read(timeout=500)
-            for event in events:
-                names = [name for flag, name in PRIORITY_EVENTS if event.mask & flag]
-                if not names:
-                    continue
-                is_dir = bool(event.mask & iflags.ISDIR)
-                suffix = " [DIR]" if is_dir else ""
-                event_type = "|".join(names)
-                ts = datetime.now().strftime("%H:%M:%S")
-                line = f"{ts}  {event_type:<20} {event.name}{suffix}"
-                print(f"[WATCH] {line}")
-                try:
-                    _send_watch_event_line(send_socket, source_ip,
-                                           ctx.connected_to, ctx.key, line)
-                except OSError as exc:
-                    print(f"[WATCH] send error: {exc}")
+            if inotify_fd in readable:
+                events = inotify.read(timeout=0)
+                for event in events:
+                    names = [name for flag, name in PRIORITY_EVENTS if event.mask & flag]
+                    if not names:
+                        continue
+                    is_dir = bool(event.mask & iflags.ISDIR)
+                    suffix = " [DIR]" if is_dir else ""
+                    event_type = "|".join(names)
+                    ts = datetime.now().strftime("%H:%M:%S")
+                    line = f"{ts}  {event_type:<20} {event.name}{suffix}"
+                    print(f"[WATCH] {line}")
+                    try:
+                        _send_watch_event_line(send_socket, source_ip,
+                                               ctx.connected_to, ctx.key, line)
+                    except OSError as exc:
+                        print(f"[WATCH] send error: {exc}")
 
         inotify.close()
         try:
