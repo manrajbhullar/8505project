@@ -3,7 +3,7 @@ from evdev import InputDevice, categorize, ecodes, list_devices
 from datetime import datetime
 import threading
 
-# ================== normal_map and shift_map (keep all your existing maps) ==================
+# Maps (unchanged)
 normal_map = {
     "KEY_A": "a", "KEY_B": "b", "KEY_C": "c", "KEY_D": "d",
     "KEY_E": "e", "KEY_F": "f", "KEY_G": "g", "KEY_H": "h",
@@ -33,24 +33,11 @@ normal_map = {
     "KEY_ENTER": "\n",
 
     # Numpad
-    "KEY_KP0": "0",
-    "KEY_KP1": "1",
-    "KEY_KP2": "2",
-    "KEY_KP3": "3",
-    "KEY_KP4": "4",
-    "KEY_KP5": "5",
-    "KEY_KP6": "6",
-    "KEY_KP7": "7",
-    "KEY_KP8": "8",
-    "KEY_KP9": "9",
-    "KEY_KPDOT": ".",
-    "KEY_KPPLUS": "+",
-    "KEY_KPMINUS": "-",
-    "KEY_KPASTERISK": "*",
-    "KEY_KPSLASH": "/",
-    "KEY_KPCOMMA": ",",
-    "KEY_KPEQUAL": "=",
-    "KEY_KPENTER": "\n",
+    "KEY_KP0": "0", "KEY_KP1": "1", "KEY_KP2": "2", "KEY_KP3": "3",
+    "KEY_KP4": "4", "KEY_KP5": "5", "KEY_KP6": "6", "KEY_KP7": "7",
+    "KEY_KP8": "8", "KEY_KP9": "9", "KEY_KPDOT": ".", "KEY_KPPLUS": "+",
+    "KEY_KPMINUS": "-", "KEY_KPASTERISK": "*", "KEY_KPSLASH": "/",
+    "KEY_KPCOMMA": ",", "KEY_KPEQUAL": "=", "KEY_KPENTER": "\n",
 }
 
 shift_map = {
@@ -82,6 +69,7 @@ shift_map = {
     "KEY_ENTER": "\n",
 }
 
+# Globals
 logger_stop_event = None
 logger_thread = None
 logger_device = None
@@ -96,6 +84,10 @@ def list_devices_for_remote():
 def start_logger(log_file="hotkey.log"):
     global logger_stop_event, logger_thread, logger_device
 
+    if logger_device is None:
+        print("[ERROR] No keyboard device was selected!")
+        return
+
     logger_stop_event = threading.Event()
 
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -105,7 +97,7 @@ def start_logger(log_file="hotkey.log"):
     def logging_thread():
         try:
             print(f"✅ Listening on {logger_device.path} - {logger_device.name}")
-            print("Keyboard logger running in background.\n")
+            print("Keyboard logger is now running in background.\n")
 
             shift = False
             caps = False
@@ -113,6 +105,7 @@ def start_logger(log_file="hotkey.log"):
             for event in logger_device.read_loop():
                 if logger_stop_event.is_set():
                     break
+
                 if event.type != ecodes.EV_KEY:
                     continue
 
@@ -182,6 +175,6 @@ def get_hotkey_log_content(log_file="hotkey.log"):
         with open(log_file, "r", encoding="utf-8") as f:
             return f.read()
     except FileNotFoundError:
-        return "No hotkey.log found."
+        return "No hotkey.log found yet."
     except Exception as e:
         return f"Error reading log: {e}"
