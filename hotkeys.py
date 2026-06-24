@@ -3,7 +3,7 @@ from evdev import InputDevice, categorize, ecodes, list_devices
 from datetime import datetime
 import threading
 
-# Maps (unchanged)
+# ================== MAPS ==================
 normal_map = {
     "KEY_A": "a", "KEY_B": "b", "KEY_C": "c", "KEY_D": "d",
     "KEY_E": "e", "KEY_F": "f", "KEY_G": "g", "KEY_H": "h",
@@ -18,19 +18,11 @@ normal_map = {
     "KEY_9": "9", "KEY_0": "0",
 
     "KEY_SPACE": " ",
-    "KEY_MINUS": "-",
-    "KEY_EQUAL": "=",
-    "KEY_LEFTBRACE": "[",
-    "KEY_RIGHTBRACE": "]",
-    "KEY_BACKSLASH": "\\",
-    "KEY_SEMICOLON": ";",
-    "KEY_APOSTROPHE": "'",
-    "KEY_GRAVE": "`",
-    "KEY_COMMA": ",",
-    "KEY_DOT": ".",
-    "KEY_SLASH": "/",
-    "KEY_TAB": "\t",
-    "KEY_ENTER": "\n",
+    "KEY_MINUS": "-", "KEY_EQUAL": "=",
+    "KEY_LEFTBRACE": "[", "KEY_RIGHTBRACE": "]", "KEY_BACKSLASH": "\\",
+    "KEY_SEMICOLON": ";", "KEY_APOSTROPHE": "'", "KEY_GRAVE": "`",
+    "KEY_COMMA": ",", "KEY_DOT": ".", "KEY_SLASH": "/",
+    "KEY_TAB": "\t", "KEY_ENTER": "\n",
 
     # Numpad
     "KEY_KP0": "0", "KEY_KP1": "1", "KEY_KP2": "2", "KEY_KP3": "3",
@@ -53,23 +45,13 @@ shift_map = {
     "KEY_5": "%", "KEY_6": "^", "KEY_7": "&", "KEY_8": "*",
     "KEY_9": "(", "KEY_0": ")",
 
-    "KEY_SPACE": " ",
-    "KEY_MINUS": "_",
-    "KEY_EQUAL": "+",
-    "KEY_LEFTBRACE": "{",
-    "KEY_RIGHTBRACE": "}",
-    "KEY_BACKSLASH": "|",
-    "KEY_SEMICOLON": ":",
-    "KEY_APOSTROPHE": '"',
-    "KEY_GRAVE": "~",
-    "KEY_COMMA": "<",
-    "KEY_DOT": ">",
-    "KEY_SLASH": "?",
-    "KEY_TAB": "\t",
-    "KEY_ENTER": "\n",
+    "KEY_MINUS": "_", "KEY_EQUAL": "+", "KEY_LEFTBRACE": "{",
+    "KEY_RIGHTBRACE": "}", "KEY_BACKSLASH": "|", "KEY_SEMICOLON": ":",
+    "KEY_APOSTROPHE": '"', "KEY_GRAVE": "~", "KEY_COMMA": "<",
+    "KEY_DOT": ">", "KEY_SLASH": "?", "KEY_SPACE": " ",
+    "KEY_TAB": "\t", "KEY_ENTER": "\n",
 }
 
-# Globals
 logger_stop_event = None
 logger_thread = None
 logger_device = None
@@ -85,7 +67,7 @@ def start_logger(log_file="hotkey.log"):
     global logger_stop_event, logger_thread, logger_device
 
     if logger_device is None:
-        print("[ERROR] No keyboard device was selected!")
+        print("[ERROR] No keyboard device was selected on hosta!")
         return
 
     logger_stop_event = threading.Event()
@@ -95,17 +77,16 @@ def start_logger(log_file="hotkey.log"):
         f.write(f"Start: {timestamp}\n\n")
 
     def logging_thread():
+        dev = logger_device  # capture reference
         try:
-            print(f"✅ Listening on {logger_device.path} - {logger_device.name}")
-            print("Keyboard logger is now running in background.\n")
+            print(f"✅ Logger started on {dev.path} - {dev.name}")
 
             shift = False
             caps = False
 
-            for event in logger_device.read_loop():
+            for event in dev.read_loop():
                 if logger_stop_event.is_set():
                     break
-
                 if event.type != ecodes.EV_KEY:
                     continue
 
@@ -115,10 +96,9 @@ def start_logger(log_file="hotkey.log"):
                     key = key[0]
 
                 is_press = key_event.keystate in (key_event.key_down, key_event.key_hold)
-                is_up = key_event.keystate == key_event.key_up
 
                 if key in ("KEY_LEFTSHIFT", "KEY_RIGHTSHIFT"):
-                    shift = not is_up
+                    shift = is_press
                     continue
 
                 if key == "KEY_CAPSLOCK" and key_event.keystate == key_event.key_down:
@@ -132,7 +112,7 @@ def start_logger(log_file="hotkey.log"):
                 if key in normal_map:
                     if key.startswith("KEY_") and len(key) == 5 and key[4].isalpha():
                         use_upper = shift ^ caps
-                        char = shift_map[key] if use_upper else normal_map[key]
+                        char = shift_map.get(key, normal_map[key]) if use_upper else normal_map[key]
                     else:
                         char = shift_map.get(key, normal_map[key]) if shift else normal_map[key]
 
