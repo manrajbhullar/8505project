@@ -1224,9 +1224,9 @@ def stop_background_logger(ctx: Context):
         with open(log_path, "w", encoding="utf-8") as f:
             f.write(log_text)
 
-        print(f"\n=== Background Logger Log Received ===\n")
-        print(log_text)
-        print(f"\n=== Log saved as: {log_path} ===")
+        print(f"\n✅ Background logger stopped successfully.")
+        print(f"   Log saved to: {log_path}")
+        print(f"   Size: {len(log_text)} characters")
 
     finally:
         recv_socket.close()
