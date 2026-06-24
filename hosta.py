@@ -1029,13 +1029,15 @@ def watch_item(ctx: Context, cmd: int):
 
         if event_lines:
             log_name = f"watch_{session_start.strftime('%Y%m%d_%H%M%S')}.log"
+            log_path = os.path.join("logs", log_name)
             try:
-                with open(log_name, "w") as f:
+                os.makedirs("logs", exist_ok=True)
+                with open(log_path, "w") as f:
                     f.write(f"Path:    {watch_path}\n")
                     f.write(f"Started: {session_start.isoformat()}\n")
                     f.write(f"Events:  {count}\n\n")
                     f.write("\n".join(event_lines) + "\n")
-                print(f"Log saved: {log_name}")
+                print(f"Log saved: {log_path}")
             except OSError as exc:
                 print(f"Warning: could not save log: {exc}")
     finally:
