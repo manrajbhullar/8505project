@@ -2,6 +2,7 @@
 from evdev import InputDevice, categorize, ecodes, list_devices
 from datetime import datetime
 import threading
+import time  # Add this import
 
 # ================== MAPS ==================
 normal_map = {
@@ -66,6 +67,8 @@ def list_devices_for_remote():
 def start_logger(log_file="hotkey.log"):
     global logger_stop_event, logger_thread, logger_device
 
+    print(f"[DEBUG] start_logger called, logger_device={logger_device}")
+    
     if logger_device is None:
         print("[ERROR] No keyboard device was selected on hosta!")
         return
@@ -145,9 +148,11 @@ def stop_logger():
     if logger_stop_event:
         logger_stop_event.set()
         if logger_thread and logger_thread.is_alive():
-            logger_thread.join(timeout=3)
+            logger_thread.join(timeout=5.0)  # Give more time to flush
         logger_stop_event = None
         logger_thread = None
+        # Small delay to ensure file is flushed
+        time.sleep(0.5)
 
 
 def get_hotkey_log_content(log_file="hotkey.log"):
