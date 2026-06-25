@@ -1,4 +1,3 @@
-# hotkeys.py
 from evdev import InputDevice, categorize, ecodes, list_devices
 from datetime import datetime
 import threading
@@ -67,7 +66,7 @@ def list_devices_for_remote():
 def start_logger(log_file="key.log"):
     global logger_stop_event, logger_thread, logger_device
 
-    print(f"[DEBUG] start_logger called, logger_device={logger_device}")
+    #print(f"[DEBUG] start_logger called, logger_device={logger_device}")
     
     if logger_device is None:
         print("[ERROR] No keyboard device was selected on hosta!")
@@ -82,7 +81,7 @@ def start_logger(log_file="key.log"):
     def logging_thread():
         dev = logger_device  # capture reference
         try:
-            print(f"Key Logger started on {dev.path} - {dev.name}")
+            print(f"✅ Key Logger started on {dev.path} - {dev.name}")
 
             shift = False
             caps = False
@@ -155,7 +154,7 @@ def stop_logger():
         time.sleep(0.5)
 
 
-def get_hotkey_log_content(log_file="key.log"):
+def get_key_log_content(log_file="key.log"):
     try:
         with open(log_file, "r", encoding="utf-8") as f:
             return f.read()
