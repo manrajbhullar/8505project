@@ -1186,7 +1186,7 @@ def stop_key_logger(ctx: Context):
         with open(log_path, "w", encoding="utf-8") as f:
             f.write(log_text)
 
-        print(f"\n✅ Key logger stopped successfully.")
+        print(f"✅ Key logger stopped successfully.")
         print(f"   Log saved to: {log_path}")
         print(f"   Size: {len(log_text)} characters")
 
