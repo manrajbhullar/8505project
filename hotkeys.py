@@ -136,7 +136,7 @@ def start_logger(log_file="hotkey.log"):
             print(f"Logger error: {e}")
         finally:
             with open(log_file, "a", encoding="utf-8") as f:
-                f.write("\n" + "-" * 60 + "\n\n")
+                f.write("-" * 60 + "\n\n")
             print("Logger stopped.")
 
     logger_thread = threading.Thread(target=logging_thread, daemon=True)
