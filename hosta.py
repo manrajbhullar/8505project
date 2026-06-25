@@ -1197,6 +1197,7 @@ def stop_key_logger(ctx: Context):
 
 if __name__ == "__main__":
     print("--------------- CONTROLLER ---------------")
+    print("----------------- VICTIM -----------------")
     ctx = Context()
     parse_arguments(ctx)
     handle_arguments(ctx)

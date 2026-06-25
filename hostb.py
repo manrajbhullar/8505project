@@ -1249,7 +1249,7 @@ def run_program(ctx: Context):
 
 
 if __name__ == "__main__":
-    print("--------------- VICTIM ---------------")
+    print("----------------- VICTIM -----------------")
     ctx = Context()
     parse_arguments(ctx)
     handle_arguments(ctx)
