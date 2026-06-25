@@ -1128,7 +1128,7 @@ def run_bg(ctx: Context):
 
         choice_bytes = receive_byte_stream_chunked(
             recv_socket, send_socket, source_ip, ctx.connected_to,
-            ctx.key, METADATA_TIMEOUT_SECONDS
+            ctx.key, 60
         )
         if choice_bytes is None:
             print("[BG] Choice receive failed")

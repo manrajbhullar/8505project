@@ -1205,7 +1205,7 @@ def stop_background_logger(ctx: Context):
                              encrypt_identifier(CMD_STOP_BG, ctx.key), 1)
 
         if not wait_for_ack_ready(recv_socket, ctx.destination_ip, ctx.key,
-                                  READY_TIMEOUT_SECONDS):
+                                  10):
             print("No ready ack from hostb.")
             return
 
