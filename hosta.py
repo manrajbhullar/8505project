@@ -1122,9 +1122,9 @@ def start_key_logger(ctx: Context):
             print("Failed to receive device list.")
             return
 
-        print("\n--- Devices Available on Victim---")
+        print("\n--- Keyboards Available on Victim ---")
         print(device_list_bytes.decode("utf-8", errors="replace"))
-        print("--- End ---")
+        print("--- End ---\n")
 
         try:
             choice = input("Select device number> ").strip()
