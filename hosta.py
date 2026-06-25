@@ -579,7 +579,6 @@ def establish_session(ctx: Context):
             send_socket.sendto(ip + tcp, (ctx.destination_ip, port))
             print(f"  SYN -> {ctx.destination_ip}:{port}")
 
-        print("Waiting for ack...")
         deadline = time.time() + ACK_TIMEOUT_SECONDS
         while True:
             remaining = deadline - time.time()
