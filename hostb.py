@@ -171,7 +171,7 @@ def build_tcp_ack_header(source_ip, destination_ip):
             0,                        # sequence number
             1,                        # ack number
             0x50,                     # data offset 5 (20 bytes), reserved 0
-            0x10,                     # flags: ACK only
+            0x02,                     # flags: ACK only
             65535,                    # window
             checksum,
             0,                        # urgent pointer
