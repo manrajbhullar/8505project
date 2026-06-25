@@ -162,7 +162,7 @@ def build_ip_header(source_ip, destination_ip, total_length, protocol=socket.IPP
     return with_checksum(compute_checksum(with_checksum(0)))
 
 
-def build_tcp_ack_header(source_ip, destination_ip):
+def build_tcp_syn_header(source_ip, destination_ip):
     def with_checksum(checksum):
         return struct.pack(
             "!HHLLBBHHH",
@@ -868,7 +868,7 @@ def establish_session(ctx: Context):
         handle_error(ctx)
 
     try:
-        tcp_header = build_tcp_ack_header(source_ip, ctx.connected_to)
+        tcp_header = build_tcp_syn_header(source_ip, ctx.connected_to)
         ip_header = build_ip_header(source_ip, ctx.connected_to, 20 + len(tcp_header))
         try:
             raw_socket.sendto(
