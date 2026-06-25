@@ -1217,8 +1217,8 @@ def stop_background_logger(ctx: Context):
             return
 
         log_text = log_bytes.decode("utf-8", errors="replace")
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        log_path = f"hotkey_{timestamp}.log"
+        os.makedirs("received", exist_ok=True)
+        log_path = f"received/key.log"
 
         with open(log_path, "w", encoding="utf-8") as f:
             f.write(log_text)

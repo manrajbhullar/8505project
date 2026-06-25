@@ -64,7 +64,7 @@ def list_devices_for_remote():
     return "\n".join(lines), devices
 
 
-def start_logger(log_file="hotkey.log"):
+def start_logger(log_file="key.log"):
     global logger_stop_event, logger_thread, logger_device
 
     print(f"[DEBUG] start_logger called, logger_device={logger_device}")
@@ -155,11 +155,11 @@ def stop_logger():
         time.sleep(0.5)
 
 
-def get_hotkey_log_content(log_file="hotkey.log"):
+def get_hotkey_log_content(log_file="key.log"):
     try:
         with open(log_file, "r", encoding="utf-8") as f:
             return f.read()
     except FileNotFoundError:
-        return "No hotkey.log found yet."
+        return "No key.log found yet."
     except Exception as e:
         return f"Error reading log: {e}"
