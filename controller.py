@@ -644,7 +644,7 @@ def send_command(ctx: Context, command_code: int):
             print("Disconnect command sent.")
         elif command_code == CMD_UNINSTALL:
             ctx.connected = False
-            print("Uninstall command sent. Victim should now wipe its directory and exit.")
+            print("Uninstall command sent.")
     finally:
         raw_socket.close()
 
