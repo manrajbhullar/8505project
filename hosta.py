@@ -994,7 +994,7 @@ def watch_item(ctx: Context, cmd: int):
                 pass
 
         count = len(event_lines)
-        print(f"\nWatch stopped. {count} event(s) captured.")
+        print(f"Watch stopped. {count} event(s) captured.")
 
         if event_lines:
             log_name = f"watch_{session_start.strftime('%Y%m%d_%H%M%S')}.log"
@@ -1081,7 +1081,7 @@ def run_program(ctx: Context):
         except UnicodeDecodeError:
             output_text = output_bytes.decode("utf-8", errors="replace")
 
-        print(f"\n--- Output from victim ({len(output_bytes)} bytes) ---")
+        print(f"\n--- Output from Victim ({len(output_bytes)} bytes) ---")
         if output_text:
             print(output_text, end="" if output_text.endswith("\n") else "\n")
         print("--- End ---")
@@ -1206,9 +1206,8 @@ if __name__ == "__main__":
     while True:
         choice = display_menu(ctx)
         if choice == "exit":
-            print("\nExiting.")
+            print("\nProgram terminated.")
             sys.exit(0)
-
         if choice == "1":
             print("\nEstablishing session...")
             establish_session(ctx)

@@ -1302,4 +1302,4 @@ if __name__ == "__main__":
             else:
                 print(f"Ignoring unknown command code {command_code}.")
 
-    print("\nShutting down.")
+    print("\nProgram terminated.")
