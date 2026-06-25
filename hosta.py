@@ -630,7 +630,7 @@ def establish_session(ctx: Context):
             _, dst_port, _, _, _, flags, _, _, _ = struct.unpack("!HHLLBBHHH", tcp_header)
             if dst_port != SOURCE_PORT:
                 continue
-            if flags & TCP_ACK_FLAG:
+            if flags & TCP_SYN_FLAG:
                 print("Connection established.")
                 ctx.connected = True
                 return
