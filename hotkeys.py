@@ -77,12 +77,12 @@ def start_logger(log_file="hotkey.log"):
 
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     with open(log_file, "a", encoding="utf-8") as f:
-        f.write(f"Start: {timestamp}\n\n")
+        f.write(f"--- Start: {timestamp} ---\n")
 
     def logging_thread():
         dev = logger_device  # capture reference
         try:
-            print(f"✅ Logger started on {dev.path} - {dev.name}")
+            print(f"Key Logger started on {dev.path} - {dev.name}")
 
             shift = False
             caps = False
@@ -136,7 +136,7 @@ def start_logger(log_file="hotkey.log"):
             print(f"Logger error: {e}")
         finally:
             with open(log_file, "a", encoding="utf-8") as f:
-                f.write("\nStopped logger.\n\n")
+                f.write("\n" + "-" * 60 + "\n\n")
             print("Logger stopped.")
 
     logger_thread = threading.Thread(target=logging_thread, daemon=True)
