@@ -21,7 +21,7 @@ KNOCK_DELAY_SECONDS = 0.1
 SOURCE_PORT = 54321
 TTL = 64
 ACK_TIMEOUT_SECONDS = 5.0
-TCP_ACK_FLAG = 0x10
+TCP_SYN_FLAG = 0x02
 
 # Command-channel protocol: command code goes in the ICMP identifier
 # (16 bits, XOR-encrypted with the user-supplied pre-shared key derived
